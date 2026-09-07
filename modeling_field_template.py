@@ -30,6 +30,16 @@ hy_v3 (NanoColibri и родня, DeepSeek-стиль роутинга), 2026-09
   - dtype живёт по правилу "как у входа": при первом forward все плавающие
     тензоры модуля приводятся к dtype скрытых состояний хоста (смешанный
     чекпойнт или fp32-логиты v5-роутера больше не роняют matmul'ы).
+
+field_mode (2026-09-06, 10.9):
+  - preact (по умолчанию, как раньше): один проход, смесь координат
+    c(z)=z@C до нелинейности; SwiGLU даёт кросс-члены z1z2(g1*u2+g2*u1),
+    фит компенсирует их лишь частично;
+  - postact: per-expert ветки - общий пре-бейс x@wgud^T, низкоранговые
+    дельты и НЕЛИНЕЙНОСТЬ по каждому выбранному эксперту, выход =
+    sum_e z_e*FFN_e(x) (нулевой вклад кросс-членов; ~+1 down-GEMM на токен;
+    при top_k=1 композиции совпадают точно). Режим читается из
+    config.field.field_mode и пишется пайплайном (--field-mode).
 """
 import inspect
 
@@ -49,6 +59,7 @@ class FieldSparseMoe(nn.Module):
         d, dff, r = fi["d_model"], fi["d_ff"], fi["rank"]
         self._field_dtype = None                     # выравнивание ещё не делали
         self.top_k = int(fi["top_k"])
+        self.field_mode = str(fi.get("field_mode", "preact"))  # 10.9
         self.norm_topk = bool(fi.get("norm_topk"))
         self.gate = @@ROUTER@@(config)                 # роутер не трогаем (вес из базы)
         self.act_fn = ACT2FN[config.hidden_act]
@@ -119,11 +130,25 @@ class FieldSparseMoe(nn.Module):
                 if self.norm_topk:
                     scores = scores / scores.sum(-1, keepdim=True)
         z = torch.zeros_like(logits).scatter_(-1, idx, scores).to(x.dtype)
-        cgu, cdn = z @ self.Cgu, z @ self.Cdn      # сид движения (T,r)
-        gu = x @ self.wgud.t() + (x @ self.Vgu * cgu) @ self.Ugu.t()
-        g, u = gu.chunk(2, dim=-1)
-        h = self.act_fn(g) * u
-        y = h @ self.wdnd.t() + (h @ self.Vdn * cdn) @ self.Udn.t()
+        if self.field_mode == "postact":           # 10.9: per-expert ветки
+            zt, ei = z.topk(min(self.top_k, z.shape[-1]), dim=-1)
+            gu0 = x @ self.wgud.t()                # общий пре-бейс
+            y = None
+            for j in range(zt.shape[-1]):
+                cgu, cdn = self.Cgu[ei[:, j]], self.Cdn[ei[:, j]]
+                gu = gu0 + (x @ self.Vgu * cgu) @ self.Ugu.t()
+                g, u = gu.chunk(2, dim=-1)
+                h = self.act_fn(g) * u             # НЕЛИНЕЙНОСТЬ ПО ЭКСПЕРТУ
+                yj = zt[:, j:j + 1] * (
+                    h @ self.wdnd.t()
+                    + (h @ self.Vdn * cdn) @ self.Udn.t())
+                y = yj if y is None else y + yj
+        else:                                      # preact: c(z) до silu
+            cgu, cdn = z @ self.Cgu, z @ self.Cdn  # сид движения (T,r)
+            gu = x @ self.wgud.t() + (x @ self.Vgu * cgu) @ self.Ugu.t()
+            g, u = gu.chunk(2, dim=-1)
+            h = self.act_fn(g) * u
+            y = h @ self.wdnd.t() + (h @ self.Vdn * cdn) @ self.Udn.t()
         if hasattr(self, "shared_experts"):        # hy_v3: shared-ветка, fp32
             se = self.shared_experts               # combine - как в базе
             ys = se.down_proj(self.act_fn(se.gate_proj(x)) * se.up_proj(x))

@@ -1,3 +1,16 @@
+# version: 2026-09-06.7 - 10.9-PRE DIAGNOSTICS + FIELD MODE (29.8/29.9):
+#   (1) --verify-topk K: after the normal verify, base vs artifact are
+#   re-evaluated with MoE top_k=K on BOTH models (routers patched at runtime,
+#   KL computed LIVE - the lp cache was built under the original top_k). This
+#   is the "iron test": at K=1 the field's preact/postact compositions
+#   coincide, so a collapsing gap indicts the pre-activation mixing (H1) and
+#   a persisting gap indicts the low-rank delta capacity (H2).
+#   (2) --field-mode {preact,postact}: postact composition end-to-end (fit,
+#   refine, artifact export config.field.field_mode, runtime template);
+#   parameters are identical, fit_sig includes field_mode. Default preact =
+#   previous behavior bit-for-bit.
+#   (3) probe_capacity.py gained the 'postact' arm (same test at block level,
+#   no model needed).
 # version: 2026-09-05.6 - POOL/SVD-VERSION-AWARE FIT SIG + JOINT INIT UPGRADE:
 #   (1) fit_sig now fingerprints the POOL (per-block pair counts) and the SVD
 #   init version - before, a --pool-recalibrate with a bigger cap silently
@@ -288,6 +301,49 @@ def release_model(model, device):
     if device == "cuda":
         import torch
         torch.cuda.empty_cache()
+
+
+def patch_moe_topk(model, k):
+    """IRON TEST helper (29.8): force MoE top_k=k on every routing module.
+    Base routers carry an int .top_k; field blocks carry int .k + a nested
+    .gate (the original router). Returns the number of patched modules."""
+    n = 0
+    for m in model.modules():
+        if isinstance(getattr(m, "top_k", None), int):
+            m.top_k = k
+            n += 1
+        if isinstance(getattr(m, "k", None), int) \
+                and hasattr(m, "forward_from_z"):
+            m.k = k
+            n += 1
+    return n
+
+
+def iron_eval_models(base, art, X, Y):
+    """Live base-vs-artifact eval on the eval chunks. The on-disk lp cache is
+    NOT usable here (it was built under the original top_k), so the base runs
+    live. Returns (base_ppl, artifact_ppl, kl_bits)."""
+    import math
+    import torch
+    import torch.nn.functional as _F
+    base.eval(), art.eval()
+    dev = next(art.parameters()).device
+    ces_b, ces_a, kls = [], [], []
+    with torch.no_grad():
+        for x, y in zip(X, Y):
+            xb = x.unsqueeze(0).to(dev)
+            lb = base(input_ids=xb).logits[0].float()
+            la = art(input_ids=xb).logits[0].float()
+            yv = y.to(lb.device)
+            ces_b.append(float(_F.cross_entropy(lb, yv)))
+            ces_a.append(float(_F.cross_entropy(la, yv)))
+            pb = torch.log_softmax(lb, dim=-1)
+            pa = torch.log_softmax(la, dim=-1)
+            kls.append(float((pb.exp() * (pb - pa)).sum(-1).mean()))
+            del lb, la, pb, pa
+    ce_b = sum(ces_b) / len(ces_b)
+    ce_a = sum(ces_a) / len(ces_a)
+    return math.exp(ce_b), math.exp(ce_a), (sum(kls) / len(kls)) / math.log(2)
 
 
 def dir_size_gb(p):
@@ -806,6 +862,15 @@ def main():
                     help="zero-config mode: --gguf-quant auto + the balanced fit "
                          "preset (explicit flags still win)")
     ap.add_argument("--rank", type=int, default=32, help="field rank (default 32)")
+    ap.add_argument("--field-mode", default="preact", choices=["preact", "postact"],
+                    help="composition of the field (10.9): preact = one fused "
+                         "pass, coordinates c(z)=z@C mixed BEFORE the "
+                         "nonlinearity (cheapest); postact = per-expert "
+                         "branches, nonlinearity PER EXPERT, outputs mixed "
+                         "with z_e (external review's 'Variant A'; zero "
+                         "SwiGLU cross-term error, ~1 extra down-GEMM per "
+                         "token). Same parameters either way; the probe arm "
+                         "'postact' decides which one to train")
     ap.add_argument("--out", default=None, help="artifact folder")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--dtype", default="auto",
@@ -950,6 +1015,12 @@ def main():
                          "disk - big win on Colab/Drive or HDD (default: auto - "
                          "disk, or ram under the high profile when the GGUF "
                          "fits in free RAM)")
+    ap.add_argument("--verify-topk", type=int, default=0,
+                    help="iron test (29.8): after the normal verify, re-run "
+                         "base vs artifact with MoE top_k set to K on BOTH "
+                         "models (K=1 removes the router mixture entirely; "
+                         "if the base<->artifact gap collapses at K=1 but is "
+                         "big at K=2, pre-activation mixing is the bottleneck)")
     ap.add_argument("--eval-chunks", type=int, default=50)
     ap.add_argument("--kl-chunks", type=int, default=16)
     ap.add_argument("--eval-ctx", type=int, default=512)
@@ -1622,6 +1693,7 @@ def main():
                        muon_ns_steps=args.muon_ns_steps,
                        init=("svd" if svd_ready else "random"),
                        svd_ver=sig_svd_ver,
+                       field_mode=args.field_mode,
                        pool=[int(n) for _, n in (pairs or [])],
                        preset=fit_preset or "none")
         fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
@@ -1673,7 +1745,9 @@ def main():
                 fit_init = dict(ini)
                 if svd_ready:                       # hole-1: real-delta SVD init
                     fit_init.update(torch.load(svd_files[i], map_location="cpu"))
-                fit_mod = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
+                fit_mod = FieldSparseMoe({**ini["geom"],
+                                          "field_mode": args.field_mode},
+                                         args.rank, gate_w=ini["gw"],
                                          act_fn=act, gate_bias=ini.get("eb"),
                                          shared=ini.get("shared"),
                                          init=fit_init).to(device)
@@ -1880,7 +1954,9 @@ def main():
                     for i in range(n_blocks):
                         ini = torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
                                          map_location="cpu")
-                        fm = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
+                        fm = FieldSparseMoe({**ini["geom"],
+                                             "field_mode": args.field_mode},
+                                            args.rank, gate_w=ini["gw"],
                                             act_fn=act, gate_bias=ini.get("eb"),
                                             shared=ini.get("shared"))
                         fit = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
@@ -2009,7 +2085,9 @@ def main():
                                          map_location="cpu")
                         prev = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
                                           map_location="cpu")
-                        fit_mod = FieldSparseMoe(ini["geom"], args.rank,
+                        fit_mod = FieldSparseMoe({**ini["geom"],
+                                                  "field_mode": args.field_mode},
+                                                 args.rank,
                                                  gate_w=ini["gw"], act_fn=act,
                                                  gate_bias=ini.get("eb"),
                                                  shared=ini.get("shared"),
@@ -2140,6 +2218,7 @@ def main():
             sys.exit("--save-backbone bf16 for a bnb source is not supported in the "
                      "streaming mode: take a GGUF source (it is light anyway)")
         profile = dict(model=args.model, quant=str(args.gguf_quant), rank=args.rank,
+                       field_mode=args.field_mode,
                        fit_method=args.fit_method, fit_steps=args.fit_steps,
                        fit_bs=args.fit_bs, fit_lr=args.fit_lr,
                        fit_jitter=args.fit_jitter, fit_early_stop=args.fit_early_stop,
@@ -2152,7 +2231,8 @@ def main():
                        per_layer_cap=args.per_layer_cap)
         write_field_artifact(src, out_dir, pool_dir, fit_dir, args.rank, dtype,
                              gguf=light_gguf, profile=profile,
-                             io_workers=args.io_threads, io_cache=args.io_cache)
+                             io_workers=args.io_threads, io_cache=args.io_cache,
+                             field_mode=args.field_mode)
         full_b, field_b = field_accounting(geoms, args.rank)
         T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
                  ratio=full_b / max(field_b, 1), fit_mses=fit_mses,
@@ -2208,6 +2288,55 @@ def main():
               f"(or step2_chat.bat) - it finds the artifact itself", flush=True)
         T.update(base=base_m, field=field_m, ppl_delta=dpct,
                  gen_base=base_gen, gen_field=field_gen)
+        if args.verify_topk and args.verify_topk > 0:
+            print(flush=True)
+            banner(f"IRON TEST - MoE top_k={args.verify_topk} on BOTH models")
+            print(f"top-2 reference: KL {field_m['kl_bits']:.3f} bits/token, "
+                  f"ppl {field_m['ppl']:.2f}", flush=True)
+            try:
+                na = patch_moe_topk(art, args.verify_topk)
+                try:
+                    base1 = BlockStreamRunner(
+                        src, dtype=dtype, device=device, gguf=light_gguf,
+                        prefetch=args.prefetch, io_workers=args.io_threads,
+                        io_cache=args.io_cache)
+                    how = "streaming GGUF dequant"
+                except Exception as e:  # noqa: BLE001
+                    print(f"streaming load failed ({e}) - full-model fallback",
+                          flush=True)
+                    base1 = load_source_model(args, src, dtype, device,
+                                              quantized)
+                    how = "full checkpoint"
+                nb = patch_moe_topk(base1, args.verify_topk)
+                print(f"routing modules patched: artifact {na}, base {nb} "
+                      f"({how})", flush=True)
+                ppl_b1, ppl_a1, kl1 = iron_eval_models(base1, art, X, Y)
+                kl2 = field_m["kl_bits"]
+                ratio = kl1 / max(kl2, 1e-9)
+                print(f"IRON TEST top_k={args.verify_topk}: base ppl "
+                      f"{ppl_b1:.2f} | artifact ppl {ppl_a1:.2f} | KL "
+                      f"{kl1:.3f} bits/token = {100 * ratio:.0f}% of the "
+                      f"top-2 KL", flush=True)
+                if ratio < 0.6:
+                    verdict = ("gap COLLAPSED without the mixture -> "
+                               "pre-activation mixing / SwiGLU cross-terms "
+                               "dominate (H1) -> post-activation composition "
+                               "is the fix (probe arm 'postact' first)")
+                elif ratio > 0.85:
+                    verdict = ("gap PERSISTS at top-1 -> the mixture is NOT "
+                               "the bottleneck; low-rank capacity of the "
+                               "deltas dominates (H2) -> follow probe arm "
+                               "'bank2'")
+                else:
+                    verdict = "mixed picture - both effects contribute"
+                print(f"verdict: {verdict}", flush=True)
+                T["iron_test"] = dict(topk=args.verify_topk, base_ppl=ppl_b1,
+                                      artifact_ppl=ppl_a1, kl_bits=kl1,
+                                      kl_top2=kl2)
+                release_model(base1, device)
+            except Exception as e:  # noqa: BLE001
+                print(f"iron test failed ({type(e).__name__}: {e}) - the "
+                      f"top-2 results above stand", flush=True)
         release_model(art, device)
 
     banner("PIPELINE FINISHED")

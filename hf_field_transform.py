@@ -1,3 +1,10 @@
+# version: 2026-09-06.7 - FIELD MODE (10.9-pre): FieldSparseMoe.forward_from_z
+#   supports mode="postact" (geom["field_mode"]): per-expert branches - shared
+#   gu pre-base, per-expert low-rank deltas, nonlinearity PER EXPERT, output
+#   mixed with z_e (external review "Variant A"; zero SwiGLU cross-term
+#   error; at top_k=1 identical to preact exactly). write_field_artifact
+#   stamps cfg.field.field_mode; the runtime template reads it. Default
+#   "preact" = previous behavior.
 # version: 2026-09-05.6 - JOINT SVD INIT: the field consumes DIAGONAL
 #   per-expert coordinates in a shared (U,V) basis, but the old builder chose
 #   U and V by two SEPARATE top-eigh problems - the diagonal then keeps only
@@ -405,6 +412,10 @@ class FieldSparseMoe(nn.Module):
         super().__init__()
         d, dff, r = geom["d_model"], geom["d_ff"], rank
         self.d, self.k = d, geom["top_k"]
+        self.mode = str(geom.get("field_mode", "preact"))  # 10.9: preact =
+        # смесь координат c(z) ДО нелинейности; postact = per-expert ветки
+        # (нелинейность по эксперту, выход = sum_e z_e*FFN_e) - при top_k=1
+        # обе композиции совпадают точно
         self.norm = geom["norm_topk"]
         self.act_fn = act_fn
         self.router_kind = str(geom.get("router_kind", "softmax"))
@@ -495,7 +506,28 @@ class FieldSparseMoe(nn.Module):
         they are frozen buffers folded into the target once (an additive
         constant does not change the gradients of the field parameters),
         which removes ~3/4 of the per-step FLOPs on hy_v3 blocks.
-        x: (T,d), z: (T,n_exp)."""
+        x: (T,d), z: (T,n_exp).
+        mode=preact: one fused pass with the mixture seed c(z)=z@C BEFORE the
+        nonlinearity (cheapest; SwiGLU cross-terms z1z2(g1*u2+g2*u1) appear
+        and are only partially fittable).
+        mode=postact (10.9): per-expert branches - the gu base x@wgud^T is
+        shared, the low-rank deltas are per-expert, the nonlinearity is
+        applied PER EXPERT, outputs mixed with z_e (zero cross-term error;
+        ~1 extra down-GEMM per token vs preact)."""
+        if self.mode == "postact":
+            zt, ei = z.topk(min(self.k, z.shape[-1]), dim=-1)
+            gu0 = x @ self.wgud.t()                      # shared pre-base
+            y = None
+            for j in range(zt.shape[-1]):
+                cgu, cdn = self.Cgu[ei[:, j]], self.Cdn[ei[:, j]]
+                gu = gu0 + (x @ self.Vgu * cgu) @ self.Ugu.t()
+                g, u = gu.chunk(2, dim=-1)
+                h = self.act_fn(g) * u                   # PER EXPERT
+                yj = zt[:, j:j + 1] * (
+                    h @ self.wdnd.t()
+                    + (h @ self.Vdn * cdn) @ self.Udn.t())
+                y = yj if y is None else y + yj
+            return y
         cgu, cdn = z @ self.Cgu, z @ self.Cdn                # movement seed
         gu = x @ self.wgud.t() + (x @ self.Vgu * cgu) @ self.Ugu.t()
         g, u = gu.chunk(2, dim=-1)
@@ -1513,6 +1545,7 @@ def field_geometry(mod, config):
     return dict(n_exp=int(mod.Cgu.shape[0]), d_model=int(mod.d),
                 d_ff=int(mod.wgud.shape[0] // 2), top_k=int(mod.k),
                 norm_topk=bool(mod.norm),
+                field_mode=str(getattr(mod, "mode", "preact")),
                 hidden_act=str(getattr(config, "hidden_act", "silu")))
 
 
@@ -1569,7 +1602,7 @@ def save_field_model(model, tokenizer, out_dir, rank, accounting, meta):
 
 def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
                          max_shard_bytes=2_000_000_000, gguf=None, profile=None,
-                         io_workers=1, io_cache="disk"):
+                         io_workers=1, io_cache="disk", field_mode="preact"):
     """Assemble the artifact (a plain HF model with the field) WITHOUT loading
     the model into RAM.
 
@@ -1592,6 +1625,8 @@ def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
         am = json.load(f)
     init0 = torch.load(os.path.join(pool_dir, "init_blk0.pt"), map_location="cpu")
     geom = dict(init0["geom"])
+    geom["field_mode"] = str(field_mode)   # init/fit weights are mode-agnostic;
+    # the composition lives in the runtime (template reads cfg.field.field_mode)
 
     # ---- config: plain model + auto_map + the field description
     with open(os.path.join(src, "config.json"), encoding="utf-8") as f:
