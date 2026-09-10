@@ -590,6 +590,38 @@ def build_tokenizer_from_gguf(meta, out_dir):
     return "gguf_bpe"
 
 
+def _inject_chat_template(out_dir, gguf_path):
+    """A GGUF-built tokenizer has no chat_template (the llama.cpp metadata
+    key tokenizer.chat_template often carries one) - without it an instruct
+    model gets raw text and glitches. Best effort: copy it from the GGUF
+    metadata into tokenizer_config.json; when absent, hf_chat.py falls back
+    to its built-in ChatML (SmolLM2-style) at runtime."""
+    import json as _json
+    try:
+        meta = read_meta(GGUFReader(gguf_path))
+        ct = meta.get("tokenizer.chat_template")
+    except Exception:  # noqa: BLE001
+        ct = None
+    if not ct:
+        log("chat_template: none in the GGUF metadata - hf_chat.py will use "
+            "its built-in ChatML fallback (SmolLM2-style)")
+        return
+    try:
+        tc_path = os.path.join(out_dir, "tokenizer_config.json")
+        tc = {}
+        if os.path.isfile(tc_path):
+            with open(tc_path, encoding="utf-8") as f:
+                tc = _json.load(f)
+        if not tc.get("chat_template"):
+            tc["chat_template"] = str(ct)
+            with open(tc_path, "w", encoding="utf-8") as f:
+                _json.dump(tc, f, ensure_ascii=False, indent=2)
+            log("chat_template: injected from the GGUF metadata")
+    except Exception as e:  # noqa: BLE001
+        log(f"chat_template injection failed ({e}) - the hf_chat.py fallback "
+            f"covers it")
+
+
 def save_tokenizer(out_dir, gguf_path, base_repo):
     from transformers import AutoTokenizer
     gguf_vocab = None
@@ -612,6 +644,9 @@ def save_tokenizer(out_dir, gguf_path, base_repo):
                     f"otherwise IndexError")
             else:
                 tok.save_pretrained(out_dir)
+                if not getattr(tok, "chat_template", None):
+                    log("chat_template: the base_repo tokenizer has none - "
+                        "hf_chat.py will use its built-in ChatML fallback")
                 log(f"tokenizer: from {base_repo} (exact)")
                 return "base_repo"
         except Exception as e:  # noqa: BLE001
@@ -619,6 +654,7 @@ def save_tokenizer(out_dir, gguf_path, base_repo):
     try:
         src = build_tokenizer_from_gguf(read_meta(GGUFReader(gguf_path)), out_dir)
         log("tokenizer: built from GGUF metadata (byte-level BPE)")
+        _inject_chat_template(out_dir, gguf_path)
         return src
     except Exception as e:  # noqa: BLE001
         log(f"GGUF tokenizer failed too: {e} - checkpoint without tokenizer")

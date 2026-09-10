@@ -16,6 +16,15 @@ Three arms, all on one block, all warm-started from the SHIPPED fit:
            cross-terms of the pre-activation composition) on REAL weights:
            at top_k=1 the two compositions coincide exactly, at top_k=2 they
            differ by the cross-terms z1z2(g1*u2 + g2*u1).
+  du     - ADD a per-expert DOWN-output delta bank (13.5, external review
+           fig12/fig14): du_e = duA_e @ duB_e^T (fresh duA randn*0.02, duB=0
+           LoRA start), rank a = --du-rank, mixed over the top-k AFTER the
+           nonlinearity. Tests whether the residual is the OUTPUT-direction
+           ceiling: the coordinate banks (cont/bank2) only address the
+           span(Udn) output subspace (toy: novelty exactly 0 for V-side
+           connectors), du adds NEW output directions (+E*(r+d)*a
+           params/block). du << bank2 => the bottleneck is the output
+           dictionary, not the mixture space.
 
 If bank2 drops the mse materially below cont - capacity binds and the
 two-bank mode becomes build 10.9. If cont == bank2 - the residual is the
@@ -121,8 +130,10 @@ def main():
     ap.add_argument("--root", required=True)
     ap.add_argument("--block", type=int, required=True)
     ap.add_argument("--rank", type=int, default=128)
-    ap.add_argument("--arm", choices=["eval", "cont", "bank2", "postact"],
+    ap.add_argument("--arm", choices=["eval", "cont", "bank2", "postact", "du"],
                     default="eval")
+    ap.add_argument("--du-rank", type=int, default=4,
+                    help="rank a of the du delta bank for --arm du (13.5)")
     ap.add_argument("--steps", type=int, default=800)
     ap.add_argument("--bs", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=0.002)
@@ -152,6 +163,11 @@ def main():
         mod = PostactField(geom, a.rank, gate_w=ini["gw"],
                            gate_bias=ini.get("eb"), shared=ini.get("shared"),
                            init=prev)
+    elif a.arm == "du":                              # 13.5: du-банк на Udn
+        g = dict(geom) | {"u_mode": "rank4", "u_rank": a.du_rank}
+        mod = FieldSparseMoe(g, a.rank, gate_w=ini["gw"],
+                             gate_bias=ini.get("eb"),
+                             shared=ini.get("shared"), init=prev)
     else:
         mod = FieldSparseMoe(geom, a.rank, gate_w=ini["gw"],
                              gate_bias=ini.get("eb"),
@@ -190,6 +206,13 @@ def main():
               f"the same block - postact << cont means the pre-activation "
               f"composition (SwiGLU cross-terms) is the real bottleneck; "
               f"postact ~= cont means it is not (capacity story -> bank2)",
+              flush=True)
+    if a.arm == "du":
+        print(f"[{a.arm}] du reading (13.5): compare with 'cont' AND 'bank2' "
+              f"on the same block - du << cont means new OUTPUT directions "
+              f"pay (output-dictionary ceiling, -> --u-mode rank{a.du_rank}/"
+              f"full in the pipeline); du ~= cont means the output side is "
+              f"not the binding constraint (mixture-space story -> bank2)",
               flush=True)
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        f"probe_blk{a.block}_{a.arm}.pt")

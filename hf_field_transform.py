@@ -1,3 +1,31 @@
+# version: 2026-09-10.1 - DU-BANK (13.5): per-expert deltas on the DOWN
+#   output factor (external review fig12/fig14: the combination dictionary
+#   (coverage) monotonically predicts quality, Spearman -0.94; novelty = 0
+#   for V-side connectors - new OUTPUT directions can only come from the
+#   second matrix). geom["u_mode"]: "none" (default, bit-identical to 13.4)
+#   | "rank1" | "rank4" (+E*(r+d)*a params/block, geom["u_rank"], a=4
+#   default) | "full" (+E*r*d). Delta_e = duA_e @ duBdn_e^T applied to
+#   (h@Vdn) as an extra top-k-mixed output term; LoRA start (duBdn=0/
+#   duEdn=0) -> step 0 is bit-identical to u_mode none. Naming "du*"
+#   (NOT U*/V*) is deliberate: the Muon by-name split and the
+#   train=core/cores freeze (which catch U*/V*) must NEVER freeze the du
+#   factors - they are the new capacity and have to train in polish modes.
+# version: 2026-09-08.4 - WH-CHECK (13.3): (1) train="cores" - the stricter
+#   polish: U*/V* AND the centroids w* (wgud/wdnd) stay frozen, only the
+#   cores Cgu/Cdn (+ C2* if banks=2) train - the external-review recipe
+#   "W0 must not move"; A/B against "core" decides the default later.
+#   (2) core/cores fits print a per-tensor DRIFT line (max|p-p0| as % of
+#   max|p0|) - shows whether the centroid actually moved in the polish.
+# version: 2026-09-08.3 - T2-POLISH (13.1): (1) best-state OFF-BY-ONE fix in
+#   fit_field_module / polish_router_module - the snapshot was taken AFTER
+#   opt.step() while its score was the PRE-step loss, so with a bank init
+#   that is already optimal at step 0 the divergence bail always shipped
+#   "init + one optimizer kick" (re-eval ~1000x the step-0 mse; artifact
+#   KL 2.288). The decision block (ema/best/bail/early-stop) now runs BEFORE
+#   the step; snapshots are pre-step params. (2) train="core" fit mode: the
+#   shared U*/V* basis stays frozen, cores/centroids/router train - the
+#   polish for a ~converged bank init. (3) the init baseline (eval8) prints
+#   unconditionally (also with --skip-fit-guard).
 # version: 2026-09-06.7 - FIELD MODE (10.9-pre): FieldSparseMoe.forward_from_z
 #   supports mode="postact" (geom["field_mode"]): per-expert branches - shared
 #   gu pre-base, per-expert low-rank deltas, nonlinearity PER EXPERT, output
@@ -388,28 +416,59 @@ def expert_stack(block):
     raise RuntimeError(f"cannot extract experts from {type(exp).__name__}")
 
 
-def field_accounting(geoms, rank):
-    """Bytes (fp16) of full experts vs the field over all MoE blocks."""
+def field_accounting(geoms, rank, banks=1, core="diag", u_mode="none",
+                     u_rank=4):
+    """Bytes (fp16) of full experts vs the field over all MoE blocks.
+    banks (UPDATE-12): every extra coordinate bank repeats the U,V factors
+    and the C coordinates (the centroid term is shared).
+    core (UPDATE-13): "dense" = Tucker-2 - coordinates become a per-expert
+    DENSE core rank x rank (the U,V cost is unchanged).
+    u_mode (13.5): per-expert DOWN deltas - rank1/rank4 add n*(r+d)*a
+    params per block (duAduBdn factors), full adds n*rank*d (duEdn)."""
     full = field = 0
+    coords_per_exp = rank * rank if str(core) == "dense" else rank
+    um = str(u_mode)
+    a = (1 if um == "rank1" else int(u_rank)) if um in ("rank1", "rank4") else 0
     for g in geoms:
         d, dff, n = g["d_model"], g["d_ff"], g["n_exp"]
         full += n * (2 * dff * d + d * dff) * 2
+        du = (n * (rank + d) * a) if a else \
+             (n * rank * d if um == "full" else 0)
         field += ((2 * dff * d + d * dff)                    # centroids
-                  + rank * (2 * dff + d) + rank * (d + dff)  # U,V
-                  + 2 * n * rank) * 2                        # coordinates C
+                  + int(banks) * (rank * (2 * dff + d)       # U,V per bank
+                                  + rank * (d + dff)         # U,V dn per bank
+                                  + 2 * n * coords_per_exp)  # core/C
+                  + du) * 2                                  # du-bank (13.5)
     return full, field
 
 
-# ------------------------------------------------------------- field module
+def apply_core(geom, dense):
+    """UPDATE-13: копия geom с проставленным kind ядра. dense=True ->
+    "dense" (Tucker-2, C (n_exp, r, r)); False -> geom без изменений
+    (старые артефакты/кэши без ключа core остаются диагональными)."""
+    g = dict(geom)
+    if dense:
+        g["core"] = "dense"
+    return g
 
 class FieldSparseMoe(nn.Module):
     """MoE block "field engine". gate=None -> fit (manual router from the
     weight); gate=<base router> -> deploy (contract identical to the base
-    block)."""
+    block). banks (UPDATE-12): number of coordinate banks; bank 2 adds a
+    second (U2,V2,C2) triple per side - the reachable per-token delta space
+    doubles (rowspan(C1)+rowspan(C2)), lifting the min(n_exp, rank) mixture
+    ceiling measured in the capacity probe; mathematically additive in BOTH
+    field modes, and banks=2 with zero bank-2 params is bit-identical to
+    banks=1."""
 
     def __init__(self, geom, rank, gate=None, gate_w=None, act_fn=F.silu,
-                 dtype=torch.float32, init=None, gate_bias=None, shared=None):
+                 dtype=torch.float32, init=None, gate_bias=None, shared=None,
+                 banks=1):
         super().__init__()
+        self.banks = max(1, int(banks))
+        self.core = str(geom.get("core", "diag"))   # UPDATE-13: dense =
+        # Tucker-2: C - ПЛОТНОЕ ядро (n_exp, r, r) вместо диагонали (n_exp, r);
+        # diag (по умолчанию) - прежнее поведение бит-в-бит.
         d, dff, r = geom["d_model"], geom["d_ff"], rank
         self.d, self.k = d, geom["top_k"]
         self.mode = str(geom.get("field_mode", "preact"))  # 10.9: preact =
@@ -448,10 +507,51 @@ class FieldSparseMoe(nn.Module):
             self.register_parameter(
                 f"V{nm}", nn.Parameter((torch.randn(inp, r, generator=grng) * 0.02).to(dtype)))
             self.field_names += [f"w{nm}d", f"U{nm}", f"V{nm}"]
+        c_shape = (geom["n_exp"], r, r) if self.core == "dense" \
+            else (geom["n_exp"], r)
         for nm in ("Cgu", "Cdn"):
             self.register_parameter(
-                nm, nn.Parameter(torch.zeros(geom["n_exp"], r, dtype=dtype)))
+                nm, nn.Parameter(torch.zeros(c_shape, dtype=dtype)))
             self.field_names.append(nm)
+        if self.banks >= 2:          # UPDATE-12: second coordinate bank
+            # банк 2 остаётся ДИАГОНАЛЬНЫМ и в dense-режиме (ядро Tucker-2
+            # уже несёт cross-члены общего базиса; bank-2 - запас на вырост)
+            for nm, out, inp in (("gu", 2 * dff, d), ("dn", d, dff)):
+                self.register_parameter(
+                    f"U2{nm}", nn.Parameter(
+                        (torch.randn(out, r, generator=grng) * 0.02).to(dtype)))
+                self.register_parameter(
+                    f"V2{nm}", nn.Parameter(
+                        (torch.randn(inp, r, generator=grng) * 0.02).to(dtype)))
+                self.field_names += [f"U2{nm}", f"V2{nm}"]
+            for nm in ("C2gu", "C2dn"):
+                self.register_parameter(
+                    nm, nn.Parameter(
+                        torch.zeros(geom["n_exp"], r, dtype=dtype)))
+                self.field_names.append(nm)
+        self.u_mode = str(geom.get("u_mode", "none"))    # 13.5: du-bank
+        self.u_rank = int(geom.get("u_rank", 4))         # rank a (rank4)
+        if self.u_mode not in ("none", "rank1", "rank4", "full"):
+            raise ValueError(f"unknown u_mode: {self.u_mode}")
+        if self.u_mode in ("rank1", "rank4"):
+            # per-expert DOWN delta duAdu[e] @ duBdn[e]^T (fig12); duA = randn
+            # (same 0.02 scale as the U,V guard fix B1), duB = 0 (LoRA start:
+            # the du term is EXACTLY zero at step 0, bit-identical to none;
+            # duBdn's grad is alive from step 0 through duA != 0, duAdn's
+            # wakes up one step later - the toy fig12 verified this trains)
+            a = 1 if self.u_mode == "rank1" else self.u_rank
+            self.register_parameter("duAdn", nn.Parameter(
+                (torch.randn(geom["n_exp"], r, a, generator=grng)
+                 * 0.02).to(dtype)))
+            self.register_parameter("duBdn", nn.Parameter(
+                torch.zeros(geom["n_exp"], d, a, dtype=dtype)))
+            self.field_names += ["duAdn", "duBdn"]
+        elif self.u_mode == "full":
+            # per-expert FULL delta (E, r, d), zero start: grad alive from
+            # step 0 (the term is linear in duEdn)
+            self.register_parameter("duEdn", nn.Parameter(
+                torch.zeros(geom["n_exp"], r, d, dtype=dtype)))
+            self.field_names += ["duEdn"]
         if init is not None:                                 # transfer from the fit
             with torch.no_grad():
                 for k, v in init.items():
@@ -513,26 +613,96 @@ class FieldSparseMoe(nn.Module):
         mode=postact (10.9): per-expert branches - the gu base x@wgud^T is
         shared, the low-rank deltas are per-expert, the nonlinearity is
         applied PER EXPERT, outputs mixed with z_e (zero cross-term error;
-        ~1 extra down-GEMM per token vs preact)."""
+        ~1 extra down-GEMM per token vs preact).
+        banks>=2 (UPDATE-12): the second (U2,V2,C2) bank adds its delta
+        additively in the SAME spaces (gu before the nonlinearity, dn after
+        it), so with bank-2 params zeroed the output is bit-identical to
+        the single-bank field; a trained bank 2 doubles the reachable
+        per-expert delta rank (2r) and the mixture space (rowspan(C1)+
+        rowspan(C2)).
+    core (UPDATE-13): "diag" (default) - per-expert coordinates C_e are a
+    vector (r,); "dense" - Tucker-2: C_e is a DENSE core (r, r) and the
+    per-expert delta is U G_e Vᵀ (cross-terms of the shared basis; init via
+    whbank_build --bank-init t2). Bank 2 stays diagonal in dense mode."""
         if self.mode == "postact":
             zt, ei = z.topk(min(self.k, z.shape[-1]), dim=-1)
             gu0 = x @ self.wgud.t()                      # shared pre-base
             y = None
             for j in range(zt.shape[-1]):
-                cgu, cdn = self.Cgu[ei[:, j]], self.Cdn[ei[:, j]]
-                gu = gu0 + (x @ self.Vgu * cgu) @ self.Ugu.t()
+                if self.core == "dense":                 # UPDATE-13: Tucker-2
+                    gu = gu0 + torch.einsum(
+                        "bkl,bl->bk", self.Cgu[ei[:, j]],
+                        x @ self.Vgu) @ self.Ugu.t()
+                else:
+                    cgu = self.Cgu[ei[:, j]]
+                    gu = gu0 + (x @ self.Vgu * cgu) @ self.Ugu.t()
+                if self.banks >= 2:                      # UPDATE-12: bank 2
+                    c2gu = self.C2gu[ei[:, j]]
+                    gu = gu + (x @ self.V2gu * c2gu) @ self.U2gu.t()
                 g, u = gu.chunk(2, dim=-1)
                 h = self.act_fn(g) * u                   # PER EXPERT
-                yj = zt[:, j:j + 1] * (
-                    h @ self.wdnd.t()
-                    + (h @ self.Vdn * cdn) @ self.Udn.t())
+                if self.core == "dense":                 # UPDATE-13
+                    yj = zt[:, j:j + 1] * (
+                        h @ self.wdnd.t()
+                        + torch.einsum("bkl,bl->bk", self.Cdn[ei[:, j]],
+                                       h @ self.Vdn) @ self.Udn.t())
+                else:
+                    cdn = self.Cdn[ei[:, j]]
+                    yj = zt[:, j:j + 1] * (
+                        h @ self.wdnd.t()
+                        + (h @ self.Vdn * cdn) @ self.Udn.t())
+                if self.banks >= 2:                      # UPDATE-12: bank 2
+                    c2dn = self.C2dn[ei[:, j]]
+                    yj = yj + zt[:, j:j + 1] * (
+                        (h @ self.V2dn * c2dn) @ self.U2dn.t())
+                if self.u_mode == "full":                # 13.5: du-bank
+                    yj = yj + zt[:, j:j + 1] * torch.matmul(
+                        (h @ self.Vdn).unsqueeze(1),
+                        self.duEdn[ei[:, j]]).squeeze(1)
+                elif self.u_mode in ("rank1", "rank4"):
+                    yj = yj + zt[:, j:j + 1] * torch.matmul(
+                        torch.matmul((h @ self.Vdn).unsqueeze(1),
+                                     self.duAdn[ei[:, j]]),
+                        self.duBdn[ei[:, j]].mT).squeeze(1)
                 y = yj if y is None else y + yj
             return y
-        cgu, cdn = z @ self.Cgu, z @ self.Cdn                # movement seed
-        gu = x @ self.wgud.t() + (x @ self.Vgu * cgu) @ self.Ugu.t()
+        if self.core == "dense":                         # UPDATE-13: Tucker-2
+            # смесь ядер: G_mix = sum_e z_e G_e, дельта = U G_mix Vᵀ - два
+            # батч-эйнсама, без per-expert цикла (T*r² флопов на токен)
+            gu = x @ self.wgud.t() + torch.einsum(
+                "tkl,tl->tk",
+                torch.einsum("te,ekl->tkl", z, self.Cgu),
+                x @ self.Vgu) @ self.Ugu.t()
+        else:
+            cgu = z @ self.Cgu                               # movement seed
+            gu = x @ self.wgud.t() + (x @ self.Vgu * cgu) @ self.Ugu.t()
+        if self.banks >= 2:                              # UPDATE-12: bank 2
+            gu = gu + (x @ self.V2gu * (z @ self.C2gu)) @ self.U2gu.t()
         g, u = gu.chunk(2, dim=-1)
         h = self.act_fn(g) * u
-        return h @ self.wdnd.t() + (h @ self.Vdn * cdn) @ self.Udn.t()
+        if self.core == "dense":                         # UPDATE-13
+            y = h @ self.wdnd.t() + torch.einsum(
+                "tkl,tl->tk",
+                torch.einsum("te,ekl->tkl", z, self.Cdn),
+                h @ self.Vdn) @ self.Udn.t()
+        else:
+            cdn = z @ self.Cdn
+            y = h @ self.wdnd.t() + (h @ self.Vdn * cdn) @ self.Udn.t()
+        if self.banks >= 2:                              # UPDATE-12: bank 2
+            y = y + (h @ self.V2dn * (z @ self.C2dn)) @ self.U2dn.t()
+        if self.u_mode != "none":                        # 13.5: du-bank поверх
+            zt, ei = z.topk(min(self.k, z.shape[-1]),    # preact: та же
+                            dim=-1)                      # top-k-смесь выхода
+            hv = h @ self.Vdn                            # (h общий -> hv один)
+            for j in range(zt.shape[-1]):
+                if self.u_mode == "full":
+                    y = y + zt[:, j:j + 1] * torch.matmul(
+                        hv.unsqueeze(1), self.duEdn[ei[:, j]]).squeeze(1)
+                else:
+                    y = y + zt[:, j:j + 1] * torch.matmul(
+                        torch.matmul(hv.unsqueeze(1), self.duAdn[ei[:, j]]),
+                        self.duBdn[ei[:, j]].mT).squeeze(1)
+        return y
 
     def fit_params(self):
         return [getattr(self, n) for n in self.field_names]
@@ -543,7 +713,7 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
                      jitter=0.0, early_stop=0, guard_warmup=None,
                      strict_guard=False, lr_warmup=0, train_router=False,
                      router_anchor=0.0, autocast="auto", muon_max_dim=512,
-                     muon_ns_steps=5):
+                     muon_ns_steps=5, train="all"):
     """Fit the field on (MoE input -> output) pairs with Adam-family
     optimizers. X,Y: (T,d) cpu bf16.
 
@@ -601,6 +771,21 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
       small geometries they join Muon automatically (the toy's best arm),
       or force it with a higher cap - NS on big matrices costs ~40-50%
       extra step time.
+
+    train: "all" | "core" (13.1) | "cores" (13.3). core = the shared U*/V*
+      basis factors stay FROZEN for the whole fit; only the cores Cgu/Cdn, the
+      centroids w* (and the router if joint) train on Adam. With a bank init
+      that already captures most of the delta energy at step 0 the fit is a
+      POLISH: the remaining problem is (near-)convex in the cores, the
+      optimizer cannot kick the basis out of its basin, and lr can stay tiny.
+      cores = the stricter polish: U*/V* AND the centroids w* stay frozen
+      (the centroid is the analytic mean of the experts - already near-LS-
+      optimal, and Adam's per-coordinate step can drift it by up to
+      lr*steps ~ 1e-2 absolute, which is tens of % of the centroid's own
+      max on real geometry); only the cores train. In BOTH polish modes a
+      per-tensor drift line (max|p-p0| / max|p0|) is printed at the end -
+      it makes the "did W0 actually move" question measurable instead of
+      argued. "all" = the legacy full fit (for random/blind inits).
 
     autocast: "auto" -> the honest real-step probe decides (_time_fit_arms:
     1 warmup + 3 timed real steps per dtype arm, min, >=1.2x rule, cached
@@ -660,9 +845,39 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
         gen = torch.Generator().manual_seed(int(seed))  # per-block, parallel-safe
     else:
         torch.manual_seed(5)   # legacy global-RNG mode (single-threaded fits)
+    if train not in ("all", "core", "cores"):
+        raise ValueError(f"unknown fit-train mode '{train}' "
+                         f"(all | core | cores)")
     p = mod.fit_params()
     for t in p:
         t.requires_grad_(True)
+    if train in ("core", "cores"):
+        # 13.1/13.3 polish mode: the shared basis (the U*/V* factors - exactly
+        # the Newton-Schulz candidates) stays FROZEN; "cores" (13.3) freezes
+        # the centroids w* too (external-review recipe: W0 = the anchor, the
+        # analytic mean is already near-optimal - do not let Adam drift it).
+        # Frozen params simply never receive a grad, so both Adam and Muon
+        # skip them. du* factors (13.5) deliberately do NOT match the U*/V*
+        # name pattern: they are the NEW capacity (zero-start LoRA) and must
+        # train even in the polish modes.
+        n_fr = 0
+        for name, t in zip(mod.field_names, p):
+            if name.startswith(("U", "V")) or \
+                    (train == "cores" and name in ("wgud", "wdnd")):
+                t.requires_grad_(False)
+                n_fr += 1
+        _what = ("cores/centroids train" if train == "core"
+                 else "cores only train (centroids frozen)")
+        # 13.5: du* factors deliberately train even in the polish modes -
+        # say so, otherwise the log contradicts the drift lines
+        if any(str(n).startswith("du") for n in mod.field_names):
+            _what += " + du-bank (new capacity)"
+        print(f"    {log_prefix} fit-train {train}: {n_fr} basis/centroid "
+              f"factors frozen, {_what}", flush=True)
+    # 13.3 drift probe: p0 of the TRAINED tensors only (~50 MB fp32 on real
+    # geometry; frozen tensors cannot drift by construction)
+    p0 = {n: t.detach().clone()
+          for n, t in zip(mod.field_names, p) if t.requires_grad}
     wd = 0.01 if method == "adamw" else 0.0
     gw0 = None
     if train_router and hasattr(mod, "gw"):
@@ -748,8 +963,12 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
                 tot += float(F.mse_loss(mod.forward_from_z(xb, zb), yb).item())
         return tot / n_ev
 
+    first = _eval8()            # stable init-state baseline (params pristine)
+    # 13.1: always print the baseline (also with --skip-fit-guard): with a
+    # bank init this is the number the whole run stands on
+    print(f"    {log_prefix} init baseline (eval8): mse {first:.5f}",
+          flush=True)
     if guard:
-        first = _eval8()        # stable init-state baseline (params pristine)
         with torch.no_grad():
             # pure-centroid reference for the report: with the SVD init the
             # init state is already far below the centroid, so "first" is no
@@ -821,11 +1040,13 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
             loss = loss + router_anchor * (
                 ((mod.gw - gw0) ** 2).sum()
                 / (gw0 ** 2).sum().clamp_min(1e-12))
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        if sched is not None and (not lr_warmup or s >= lr_warmup):
-            sched.step()
+        # 13.1 FIX (off-by-one best state): the whole decision block runs
+        # BEFORE opt.step(), so a snapshot and its score describe the SAME
+        # (pre-step) weights. The old order snapshotted AFTER the step while
+        # scoring the PRE-step loss: with a bank init that is already optimal
+        # at step 0 the "best state" was always "init + one optimizer kick",
+        # and the divergence bail then shipped that kicked state (best-state
+        # re-eval ~1000x the step-0 mse; the artifact went to KL 2.29).
         last = float(loss.item())
         if first is None:
             first = last
@@ -850,7 +1071,7 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
                   flush=True)
             _restore()
             restored = True
-            break
+            break            # before the step: no optimizer contact past it
         if early_stop and s >= warm and (s % early_stop == 0 or s == steps - 1):
             # 2 consecutive flat checkpoints (<0.5% relative) -> stop early;
             # the checkpoint is an EMA of the minibatch mse (a raw single-batch
@@ -865,8 +1086,31 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
             else:
                 stall = 0
             ckpt_ema = cema
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if sched is not None and (not lr_warmup or s >= lr_warmup):
+            sched.step()
     for t in p:
         t.requires_grad_(False)
+    # 13.3: drift of the trained tensors vs the pre-fit state (answers the
+    # "did the centroid W0 move under Adam" question with a number, not an
+    # opinion; printed for the polish modes where every percent matters)
+    if train in ("core", "cores") and p0:
+        for n, t0 in p0.items():
+            t = getattr(mod, n)
+            d = float((t.detach() - t0.to(t.device)).abs().max())
+            s = float(t0.abs().max())
+            if s > 0.0:
+                print(f"    {log_prefix} drift {n}: max|d| {d:.3e} "
+                      f"({100 * d / s:.2f}% of max|p0| {s:.3e})",
+                      flush=True)
+            else:
+                # 13.5: zero-start params (duBdn in the du-bank) have no
+                # meaningful relative drift - print the absolute value only
+                # (the old max(s, 1e-12) guard printed astronomical percents)
+                print(f"    {log_prefix} drift {n}: max|d| {d:.3e} "
+                      f"(new param, max|p0| = 0)", flush=True)
     if best_state is not None and not restored and math.isfinite(ema) \
             and ema > best_score * 1.02:
         # a slow late drift the 2x bailout never caught - still ship the
@@ -884,7 +1128,11 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
               flush=True)
         best_state = None
     if guard and first is not None:
-        worse = (not math.isfinite(last)) or last > first
+        # 13.1: 5% tolerance - "first" and the post-restore "last" are two
+        # independent eval8 estimates; in the polish regime (last ~= first,
+        # the bank init is already optimal) a strict > turned the guard into
+        # a coin flip that raised "mse got WORSE" on identical weights
+        worse = (not math.isfinite(last)) or last > first * 1.05
         flat = (not worse) and last > 0.98 * first
         if worse or (flat and strict_guard):
             why = ("mse got WORSE than the centroid baseline" if worse else
@@ -908,9 +1156,12 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
             "path is not learning (the classic zero-init U,V,C bug). The fit "
             "degraded into a centroid; to disable the check: --skip-fit-guard")
     if guard and first:
+        # "step 0", not the eval8 baseline: `first` is the step-0 minibatch
+        # mse (the eval8 baseline was printed separately above) - the old
+        # wording "below the init baseline" read as if it referenced eval8
         print(f"    {log_prefix} guard: mse {first:.5f} -> {last:.5f} "
-              f"({100 * (first - last) / max(first, 1e-12):.1f}% below the "
-              f"init baseline; pure-centroid {centroid_first:.5f})", flush=True)
+              f"({100 * (first - last) / max(first, 1e-12):.1f}% below "
+              f"step 0; pure-centroid {centroid_first:.5f})", flush=True)
     return last
 
 
@@ -969,13 +1220,13 @@ def polish_router_module(mod, X, Y, steps, bs, lr, device, anchor=0.03,
         if anchor > 0:
             loss = loss + anchor * (((mod.gw - gw0) ** 2).sum()
                                     / (gw0 ** 2).sum().clamp_min(1e-12))
+        last = float(loss.item())      # pre-step mse (13.1: same fix as fit)
+        ema = last if best_ema is None else 0.9 * best_ema + 0.1 * last
+        if best_ema is None or ema < best_ema:
+            best_ema, best_w = ema, mod.gw.detach().clone()   # pre-step gw
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        last = float(loss.item())
-        ema = last if best_ema is None else 0.9 * best_ema + 0.1 * last
-        if best_ema is None or ema < best_ema:
-            best_ema, best_w = ema, mod.gw.detach().clone()
         if s % log_every == 0 or s == steps - 1:
             print(f"    {log_prefix} step {s}: mse {last:.5f}", flush=True)
     with torch.no_grad():
@@ -1197,6 +1448,9 @@ def _iter_expert_w(block):
 SVD_INIT_VER = "joint-v1"          # bump when the init algorithm changes:
                                    # stale-version files are rebuilt on the
                                    # next run and the fit re-runs (sig)
+FIELD_ENGINE_VER = "update-13-whrank"  # _compat_check keys on this constant:
+                                   # its absence dates a sibling file older
+                                   # than UPDATE-13 (partial update guard)
 
 
 @torch.no_grad()
@@ -1272,7 +1526,7 @@ def _joint_align_diag(U_B0, V0, B, sweeps=4, power=15, seed=1234):
 
 @torch.no_grad()
 def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
-                      log_prefix=""):
+                      log_prefix="", banks=1):
     """Shared-basis SVD init for the field parameters from the REAL expert
     deltas (hole 1, UPDATE-10). For each side (gu, dn):
       pass 1: Y = sum_e dW_e @ Omega        (randomized range finder)
@@ -1282,6 +1536,13 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
       V = topk_eigh(sum B_e^T B_e)           - input-side basis
       C_e = diag(U_B^T B_e V)                - exact coordinates of the
                                                projected deltas, NO 3rd pass
+    banks>=2 (UPDATE-12): a SECOND greedy stage on the residual -
+      R_e = B_e - U_B diag(C_e) V^T         (computed from the stash, no
+                                              extra pass over the experts)
+    then the same topk_eigh/joint-align machinery on {R_e} gives U2/V2/C2.
+    Bank 2 starts at the residual's SVD capture instead of random, so the
+    step-0 field covers ~bank1+bank2 energy of the deltas (the H2 fix:
+    the k-sweep showed the low-rank delta capacity dominates the KL gap).
     NOTE: the SVD of the MEAN delta is degenerate (sum_e dW_e = 0
     identically); the stacked-delta shared basis is the meaningful variant.
     Streaming: the full expert stack is never materialized (one expert at a
@@ -1318,6 +1579,7 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
         Bdn[e] = Qdn.t() @ (wdn - mdn)
     init = {}
     capture = {}
+    capture2 = {}
     for side, B, Q, od, idi in (("gu", Bgu, Qgu, out_dim_gu, in_dim_gu),
                                 ("dn", Bdn, Qdn, out_dim_dn, in_dim_dn)):
         if rank > min(od, idi):
@@ -1361,11 +1623,47 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
         capture[side] = num / max(den[side], 1e-12)
         init[f"capture_proj_{side}"] = float((K ** 2).sum()) \
             / max(den[side], 1e-12)
+        if banks >= 2:
+            # UPDATE-12 (bank2, greedy residual stage): subtract the bank-1
+            # reconstruction from the stashed projected deltas and run the
+            # SAME basis machinery on the residual. The stash makes this
+            # free (no extra streaming pass); bank 2 starts at the
+            # residual's SVD capture instead of random.
+            R = B.clone()
+            for e in range(n_exp):
+                R[e] -= (U_B * C[e].unsqueeze(0)) @ V.t()
+            G_out2 = sum(R[e] @ R[e].t() for e in range(n_exp))   # (q,q)
+            G_in2 = sum(R[e].t() @ R[e] for e in range(n_exp))    # (in,in)
+            U2_B0, _ = _topk_eigh(G_out2, rank, oversample, seed + 3)
+            V20, _ = _topk_eigh(G_in2, rank, oversample, seed + 4)
+            U2_Bj, V2j, f2 = _joint_align_diag(U2_B0, V20, R)
+            if f2 > _diag_capture_of(U2_B0, V20, R):
+                U2_B, V2 = U2_Bj, V2j
+            else:
+                U2_B, V2 = U2_B0, V20
+            C2 = torch.stack([torch.diagonal(U2_B.t() @ R[e] @ V2)
+                              for e in range(n_exp)])
+            init[f"U2{side}"], init[f"V2{side}"], init[f"C2{side}"] = \
+                Q @ U2_B, V2, C2
+            den2 = float(sum(float((R[e] ** 2).sum())
+                             for e in range(n_exp)))
+            capture2[side] = float((C2 ** 2).sum()) / max(den2, 1e-12)
+            K2 = torch.stack([U2_B.t() @ R[e] @ V2 for e in range(n_exp)])
+            init[f"capture2_proj_{side}"] = float((K2 ** 2).sum()) \
+                / max(den2, 1e-12)
     init["capture"] = capture
-    init["svd_ver"] = SVD_INIT_VER
+    init["capture2"] = capture2          # UPDATE-12: residual-stage capture
+    init["svd_ver"] = SVD_INIT_VER + ("+b2" if banks >= 2 else "")
+    init["banks"] = int(banks)
     parts = [f"{s} {capture[s] * 100:.1f}%" for s in ("gu", "dn") if s in capture]
     print(f"    {log_prefix} svd init ({SVD_INIT_VER}, joint-aligned): "
           "delta energy captured at step 0 - " + ", ".join(parts), flush=True)
+    if banks >= 2 and capture2:
+        parts2 = [f"{s} {capture2[s] * 100:.1f}% of the residual"
+                  for s in ("gu", "dn") if s in capture2]
+        print(f"    {log_prefix} svd init bank2 (UPDATE-12, greedy "
+              "residual): residual delta energy captured at step 0 - "
+              + ", ".join(parts2), flush=True)
     return init
 
 
@@ -1426,14 +1724,49 @@ def eval_logits_cache_disk(model, ids, ctx, n_chunks, lp_dir, seed=17):
     return X, Y
 
 
+# KL by position buckets (2026-09-07, update 11.2): every eval window is a
+# COLD START (raw text, no prompt), so an elevated first bucket means the
+# artifact breaks exactly on unseen-context tokens - the "blind at start"
+# failure mode. Free bookkeeping over per-token KL that was already computed;
+# shared by eval_vs_cache_disk and the pipeline's live iron eval.
+KL_POS_BUCKETS = ((0, 8, "0-7"), (8, 32, "8-31"), (32, 128, "32-127"),
+                  (128, 1 << 30, "128+"))
+
+
+def kl_pos_accumulate(dst, kl_tok):
+    """dst: {(lo, hi): [sum, n]} <- per-token KL of one more chunk.
+    kl_tok: 1-D tensor, KL contribution of each position of the chunk."""
+    n = int(kl_tok.numel())
+    for lo, hi, _name in KL_POS_BUCKETS:
+        if lo >= n:
+            continue
+        v = kl_tok[lo:min(hi, n)]
+        cell = dst.setdefault((lo, hi), [0.0, 0])
+        cell[0] += float(v.sum())
+        cell[1] += int(v.numel())
+
+
+def kl_pos_finish(dst):
+    """Mean KL (bits/token) per bucket; None where a bucket got no tokens
+    (short eval windows)."""
+    out = {}
+    for lo, hi, name in KL_POS_BUCKETS:
+        s, n = dst.get((lo, hi), (0.0, 0))
+        out[name] = (s / n) / math.log(2) if n else None
+    return out
+
+
 @torch.no_grad()
 def eval_vs_cache_disk(model, X, Y, lp_dir, n_max=None):
     """CE/KL against the on-disk cache of base log-probs (per chunk, flat RAM).
     n_max - verify only the first n chunks (for the base the cache is its own:
-    a full check of all chunks = wasted model passes, expensive in streaming)."""
+    a full check of all chunks = wasted model passes, expensive in streaming).
+    The returned dict also carries kl_pos (update 11.2): per-position bucket
+    KL - the "blind at start" probe, zero extra model passes."""
     model.eval()
     dev = _mdev(model)
     ces, kls = [], []
+    pos = {}
     pairs = list(zip(X, Y))
     if n_max:
         pairs = pairs[:n_max]
@@ -1449,11 +1782,14 @@ def eval_vs_cache_disk(model, X, Y, lp_dir, n_max=None):
         lq = torch.log_softmax(logits.float(), dim=-1)
         lp = lp.to(lq.device)
         p = lp.float().exp()
-        kls.append(float((p * (lp.float() - lq)).sum(-1).mean()))
+        kl_tok = (p * (lp.float() - lq)).sum(-1)
+        kls.append(float(kl_tok.mean()))
+        kl_pos_accumulate(pos, kl_tok)
         del lp
     ce = sum(ces) / len(ces)
     return dict(ce=ce, ppl=math.exp(ce),
-                kl_bits=(sum(kls) / len(kls)) / math.log(2))
+                kl_bits=(sum(kls) / len(kls)) / math.log(2),
+                kl_pos=kl_pos_finish(pos))
 
 
 # ------------------------------------------------------------------ metrics
@@ -1545,6 +1881,7 @@ def field_geometry(mod, config):
     return dict(n_exp=int(mod.Cgu.shape[0]), d_model=int(mod.d),
                 d_ff=int(mod.wgud.shape[0] // 2), top_k=int(mod.k),
                 norm_topk=bool(mod.norm),
+                banks=int(getattr(mod, "banks", 1)),
                 field_mode=str(getattr(mod, "mode", "preact")),
                 hidden_act=str(getattr(config, "hidden_act", "silu")))
 
@@ -1602,7 +1939,8 @@ def save_field_model(model, tokenizer, out_dir, rank, accounting, meta):
 
 def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
                          max_shard_bytes=2_000_000_000, gguf=None, profile=None,
-                         io_workers=1, io_cache="disk", field_mode="preact"):
+                         io_workers=1, io_cache="disk", field_mode="preact",
+                         banks=1, core="diag", u_mode="none", u_rank=4):
     """Assemble the artifact (a plain HF model with the field) WITHOUT loading
     the model into RAM.
 
@@ -1627,6 +1965,10 @@ def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
     geom = dict(init0["geom"])
     geom["field_mode"] = str(field_mode)   # init/fit weights are mode-agnostic;
     # the composition lives in the runtime (template reads cfg.field.field_mode)
+    geom["banks"] = int(banks)             # UPDATE-12: runtime registers U2*/C2*
+    geom["core"] = str(core)               # UPDATE-13: diag | dense (Tucker-2)
+    geom["u_mode"] = str(u_mode)           # 13.5: du-банк (runtime registers
+    geom["u_rank"] = int(u_rank)           # duAdn/duBdn или duEdn)
 
     # ---- config: plain model + auto_map + the field description
     with open(os.path.join(src, "config.json"), encoding="utf-8") as f:
@@ -1766,7 +2108,9 @@ def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
     import py_compile
     py_compile.compile(os.path.join(out_dir, "modeling_field.py"), doraise=True)
     shutil.rmtree(os.path.join(out_dir, "__pycache__"), ignore_errors=True)
-    meta_out = dict(rank=int(rank), n_layers=int(am["n_layers"]),
+    meta_out = dict(rank=int(rank), banks=int(banks), core=str(core),
+                    u_mode=str(u_mode), u_rank=int(u_rank),
+                    n_layers=int(am["n_layers"]),
                     backbone="copy of the source backbone (experts skipped)",
                     field_dtype=str(dtype))
     if n_routed:

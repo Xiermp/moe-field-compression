@@ -556,7 +556,9 @@ class BlockStreamRunner:
     @torch.no_grad()
     def _load_block(self, prefix):
         nb = 0
-        t0 = time.time()
+        # 13.5: perf_counter, not time.time() - wall clock can step backwards
+        # (NTP sync) and once printed a negative "(block -0.3 s)" duration
+        t0 = time.perf_counter()
         is_gguf = self._gguf is not None
 
         def bytes_of(fn, key, t):
@@ -597,7 +599,7 @@ class BlockStreamRunner:
         self._loaded = prefix
         self._stream_n += 1
         self._stream_bytes += nb
-        dt = time.time() - t0
+        dt = time.perf_counter() - t0
         self._load_time += dt
         if self.progress:
             print(f"\r    ... experts from disk: {self._stream_n} block loads, "

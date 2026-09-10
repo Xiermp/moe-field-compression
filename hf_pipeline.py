@@ -1,156 +1,54 @@
-# version: 2026-09-06.7 - 10.9-PRE DIAGNOSTICS + FIELD MODE (29.8/29.9):
-#   (1) --verify-topk K: after the normal verify, base vs artifact are
-#   re-evaluated with MoE top_k=K on BOTH models (routers patched at runtime,
-#   KL computed LIVE - the lp cache was built under the original top_k). This
-#   is the "iron test": at K=1 the field's preact/postact compositions
-#   coincide, so a collapsing gap indicts the pre-activation mixing (H1) and
-#   a persisting gap indicts the low-rank delta capacity (H2).
-#   (2) --field-mode {preact,postact}: postact composition end-to-end (fit,
-#   refine, artifact export config.field.field_mode, runtime template);
-#   parameters are identical, fit_sig includes field_mode. Default preact =
-#   previous behavior bit-for-bit.
-#   (3) probe_capacity.py gained the 'postact' arm (same test at block level,
-#   no model needed).
-# version: 2026-09-05.6 - POOL/SVD-VERSION-AWARE FIT SIG + JOINT INIT UPGRADE:
-#   (1) fit_sig now fingerprints the POOL (per-block pair counts) and the SVD
-#   init version - before, a --pool-recalibrate with a bigger cap silently
-#   KEPT the old fit (the sig did not see the pool), and better init files
-#   did not re-trigger the fit either. (2) init_svd_blk*.pt carry svd_ver;
-#   files built by an OLDER init algorithm are rebuilt automatically by the
-#   same self-heal that covers missing files (2026-09-05.5), so upgrading
-#   needs no flags and no manual deletions. (3) the stage-5 banner now shows
-#   the EFFECTIVE init (it was printed before the effective value existed,
-#   always reading like "svd init"), and the fit log prints the init's
-#   step-0 delta-energy capture so an uninformative init is visible.
-# version: 2026-09-05.5 - SVD-INIT SELF-HEAL: missing fit_dir/init_svd_blk*.pt
-#   (pool cache from a pre-SVD build, or an earlier run that fell back to the
-#   random init) are detected BEFORE the fit and rebuilt by a streaming pass
-#   from the real expert deltas - the optimizer never starts blind again. The
-#   stage-5 fallback is now a loud WARNING + report metadata, and refine
-#   rounds key their signature on the fit state (a re-fit invalidates stale
-#   refine caches: the captured pairs are the field's own forward outputs).
-# version: 2026-09-05.4 - REFINE RESUME + PARALLEL REFIT: a completed refine
-#   round is skipped on re-runs (done_r*.json markers in the run cache), a
-#   half-done round reuses the captured pairs (pairs_sig.json) instead of
-#   re-streaming the whole model for hours, and the refit loop now honors
-#   --fit-workers (before: always one worker). --refresh-refine forces a
-#   full redo.
-# version: 2026-09-05.2 - SWAP-STORM GUARD (refine freeze fix): the capture
-#   pass of the refine round kept per-block pair chunks of up to 8192 pairs in
-#   RAM for ALL blocks at once (~1.1 GB) while the io-cache ram copy was also
-#   growing - on a 3.2 GB-free box Windows slid into a swap-storm at ~block 13
-#   (no MemoryError, the run just froze). Now: the flush threshold adapts to
-#   free RAM (1024 pairs below 8 GB -> resident ~= one batch, ~0.4 GB), the
-#   capture pass prints a per-window progress line ("frozen" vs "working" is
-#   visible), and BlockStreamRunner re-checks io-cache ram at every stage
-#   (see hf_stream).
-# version: 2026-09-05.1 - LOW-RAM FIX: (1) a cached pair pool SMALLER than the
-#   requested --per-layer-cap is now KEPT by default (>= usable floor of
-#   max(4096, 16*rank, cap/2) pairs/block) instead of forcing the most
-#   expensive re-collection, which OOM-crashed low-RAM boxes and looked like
-#   "nothing was saved" - --pool-recalibrate forces the old behavior;
-#   (2) the "cached pool holds ..." notice prints once per run, not 3-6x.
-# version: 2026-09-04.3 - RESUME FIX: the run cache no longer resets to zero
-#   after an interruption ("nothing was saved"): (1) art_meta.json is written
-#   at the START of stage 4 (it was written last, so a kill during the silent
-#   centroids+SVD loop invalidated the whole pair pool on restart); (2) the
-#   stage-4 init loop is resumable per block (existing init_blk*.pt are
-#   reused, only the missing ones are rebuilt) and prints per-block progress
-#   + timing; (3) the stage-5 fit is resumable per block (fit_blk*.pt +
-#   fit_partial.json with the exact fit_sig; only unfitted blocks re-run;
-#   finished blocks are reused verbatim); (4) all cache jsons and pair/fit
-#   saves are atomic (tmp + os.replace) - a kill mid-save cannot leave a torn
-#   file that poisons the next run. Semantics of the stage-4 skip: the pair
-#   pool is reused whenever it is on disk (the expensive, model-forward part);
-#   only missing centroids/init files are rebuilt from the model.
-# version: 2026-09-04.2 - UPDATE-10 speed rebuild + the user's three holes:
-#   --fit-init {svd,random}: SVD init of U,V,C from the STACKED expert deltas
-#   (shared-basis randomized SVD over the streamed experts, saved per-rank as
-#   fit_dir/init_svd_blk*.pt; --refresh-init rebuilds those for an existing
-#   pool without recalibrating); --fit-autocast {auto,on,off} with the honest
-#   real-step probe (1 warmup + 3 timed steps per dtype arm, >=1.2x rule);
-#   --fit-method muon|muon-cosine (BY-NAME split: U*/V* only, C*/gw never),
-#   --muon-max-dim/--muon-ns-steps; jitter routing follows the clean anchor
-#   row inside fit_field_module. Toy bench: svd-init same quality in ~3x
-#   fewer steps, autocast 1.7-1.8x/step.
-#   --fit-guard-warmup (-1=auto) and --strict-fit-guard (old hard error),
-#   --fit-lr-warmup (linear Adam adaptation ramp)
+# version: 2026-09-10.2 - CLI-CLARITY (13.6): the command line rebuilt around
+#   hf_cli.py (the CLI collector): (1) a COMPONENT MANIFEST is printed on
+#   every run - each runtime file with its version stamp and a sha256
+#   fingerprint (a log always shows WHICH files executed; shadow copies on
+#   sys.path are flagged loudly); (2) the flat 76-flag argparse block became
+#   a grouped parser - pick/core/optional/tune/diag tags, --list-flags prints
+#   every flag with its default and full description; (3) --list-stages shows
+#   does/reads/writes/uses per stage and the PLAN printout annotates each
+#   planned stage; (4) every run prints "cmd:" - the effective command line
+#   for exact reproduction; (5) --version/--list-flags/--list-stages work
+#   without torch; (6) _compat_check gained TEXT checks for the 13.5 du-bank
+#   markers (a mixed file set fails fast, not subtly); (7) the artifact dir
+#   keys on u_mode (field_<tag>_r<rank>duX) - a --u-mode A/B no longer
+#   collides with the none-run (closes the audit finding); the old header
+#   changelog moved verbatim to CHANGELOG.md.
+# version: 2026-09-10.1 - DU-BANK (13.5): --u-mode none|rank1|rank4|full +
+#   --u-rank - per-expert deltas on the DOWN output factor (external review
+#   fig12/fig14: coverage monotonically predicts quality, Spearman -0.94;
+#   novelty = 0 for V-side connectors - new OUTPUT directions only come from
+#   the second matrix). rank-a adds E*(r+d)*a params/block (rank4 default
+#   a=4: +1.1M at r=64/d=4096/E=64), full adds E*r*d (+16.8M); LoRA start
+#   (duBdn=0/duEdn=0) -> step 0 bit-identical to --u-mode none. du factors
+#   train in ALL --fit-train modes (the freeze/muon splits are by-name and
+#   deliberately do not catch "du*"). Fits into a SEPARATE dir
+#   fit_r<rank>du{1,a,F}; fit_sig carries u_mode/u_rank; runtime template
+#   reads cfg.field.u_mode (old artifacts without the key = none, intact).
 #!/usr/bin/env python3
-"""Pipeline for a REAL MoE model from HuggingFace -> "field engine".
+"""Pipeline: a real MoE model from HuggingFace -> "field engine" artifact.
 
-The model is downloaded ALREADY QUANTIZED - by default the ready Q4_K_M GGUF
-from mradermacher/OLMoE-1B-7B-0924-GGUF (~4.4 GB, works without a GPU).
-What one run does:
-  0. bootstrap   - installs missing pip packages
-  1. download    - Q4_K_M.gguf from the HF hub (resumes on a re-run);
-                   NO dequant checkpoint is created: a light catalog (config +
-                   tokenizer) is built and weights are read straight from the
-                   GGUF block by block (on-the-fly dequant, saves ~14 GB of
-                   disk; --full-dequant brings back the old path with a ~14 GB
-                   checkpoint)
-  2. texts       - calibration/eval text with no overlap (leak fix)
-  3. base eval   - perplexity/log-prob cache (ON DISK)/generation;
-                   THE FULL MODEL NEVER LOADS: STREAMING - backbone in RAM
-                   (~1.5 GB), each block's experts are read from disk exactly
-                   for their layer's pass (hf_stream.py, with background
-                   prefetch of the next block)
-  4. calibrate   - (MoE input -> output) pairs via hooks + block centroids,
-                   also streaming. The pair pool on disk IS the calibration
-                   artifact: the fit samples vectors independently, text
-                   order does not matter - a re-run SKIPS STAGES 3-4
-  5. fit         - fits the field r=32 on pairs from disk: the model is NOT
-                   in RAM, peak RAM ~1-2 GB; blocks are independent and can
-                   be fitted in parallel (--fit-workers); several optimizer
-                   methods available (--fit-method, --fit-preset)
-  6. save        - the artifact is assembled STREAMINGLY from disk (backbone
-                   tensors copied one by one, experts skipped, field - from
-                   fit files); the full model never loads
-  7. verify      - the artifact loads as a NORMAL model (~1-2 GB):
-                   ppl/KL vs the quantized base + demo generation
-  8. report      - report into the artifact and results/; after success the
-                   dequant checkpoint (if any) deletes itself: what remains
-                   is GGUF + pool cache + fit + artifact (~8.6 GB vs ~22 GB)
+An expert is not stored - it is assembled on the fly from a low-rank field
+W(z) = W1d + U * diag(c(z)) * V^T (+ the optional per-expert du-bank on the
+DOWN factor, 13.5). One command runs the whole 9-stage pipeline:
+download -> texts -> base -> calibrate -> fit -> refine -> save -> verify
+-> report. Everything streams; the full model never loads.
 
-Local run:
-  python3 hf_pipeline.py                       # OLMoE Q4_K_M GGUF, rank 32
-  python3 hf_pipeline.py --auto                # zero-config: auto quant + balanced preset
-  python3 hf_pipeline.py --low-mem             # memory-frugal metrics mode
-  python3 hf_pipeline.py --threads 4           # keep some CPU cores free
-  python3 hf_pipeline.py --cleanup             # erase the GGUF ~4.4 GB after success
-  python3 hf_pipeline.py --full-dequant        # full dequant checkpoint ~14 GB after all
-  python3 hf_pipeline.py --gguf-quant Q4_K_S   # smaller file
-  python3 hf_pipeline.py --gguf-quant auto     # pick the best available quant
-  python3 hf_pipeline.py --gguf /path/model.Q4_K_M.gguf  # an already downloaded GGUF
-  python3 hf_pipeline.py --model allenai/OLMoE-1B-7B-0924  # bf16 source (~15 GB)
-  python3 hf_pipeline.py --model RichardErkhov/allenai_-_OLMoE-1B-7B-0924-4bits  # needs CUDA
+Quick start:
+  python3 hf_pipeline.py                  # OLMoE Q4_K_M GGUF, rank 32, full run
+  python3 hf_pipeline.py --auto           # zero-config: auto quant + balanced preset
+  python3 hf_pipeline.py --low-mem        # memory-frugal caps
+  python3 hf_pipeline.py --u-mode rank4   # 13.5 du-bank on the DOWN factor
 
-Fit tuning:
-  --fit-preset fast|balanced|quality           # steps/batch/lr/method bundles
-  --fit-method adam|adamw|adam-cosine|rmsprop  # optimizer type
-  --fit-workers 2                              # parallel fit of independent blocks
-  --prefetch 0                                 # disable background block prefetch
-                                               # (saves ~1 block of RAM)
-  --io-cache ram                               # keep packed GGUF tensors in RAM
-                                               # (first pass fills the cache,
-                                               # later passes read no disk)
+Introspection (no torch needed):
+  --version        what files/versions THIS run executes (sha256 fingerprints)
+  --list-stages    the stage table: does / reads / writes / uses
+  --list-flags     EVERY flag: required/optional, default, full description
+  --help           grouped flags + recipes (at the end)
 
-Stage toggles (the auto-pipeline is a chain of 9 stages; any can be switched
-on/off - the plan is printed before the run):
-  python3 hf_pipeline.py --list-stages             # the stage table
-  python3 hf_pipeline.py --stages fit,save,verify  # run ONLY these (from cache)
-  python3 hf_pipeline.py --skip base,verify,report # run all EXCEPT these
-  python3 hf_pipeline.py --skip download           # reuse-only: never touch the network
-  python3 hf_pipeline.py --stages fit --rank 64    # a new rank from the cached pool
-  python3 hf_pipeline.py --stages refine --refine-rounds 1  # refine implies rounds>=1
-  --gen-tokens 0        # no demo generations (saves a streaming pass)
-  --no-cache-verify     # skip the 2-chunk log-prob cache self-check
-Cheap missing stages (texts/download) are auto-added with a notice; expensive
-ones (base/calibrate/fit/verify) fail fast with a hint instead of surprising
-you with a multi-hour pass. A re-run also auto-skips whatever is cached.
-
-Windows: the same commands via double click - step1_compress.bat / step2_chat.bat.
+Every run prints: the component manifest (file + version + sha256), the stage
+plan with per-stage roles, the effective profile, and "cmd:" - the exact
+command that reproduces the run. Version history: CHANGELOG.md, UPDATE-*.md.
 """
-import argparse
 import gc
 import hashlib
 import importlib.util
@@ -165,6 +63,7 @@ import threading
 import time
 
 import hf_env  # noqa: F401  - HF cache inside the project; BEFORE transformers/hub
+import hf_cli      # noqa: F401  - CLI collector: parser, manifest, stage tables (13.6)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DL = os.environ.get("MOE_OUT_DIR", os.path.join(BASE, "results"))
@@ -185,19 +84,10 @@ FIT_LEGACY = dict(fit_steps=300, fit_bs=4096, fit_lr=2e-3, fit_method="adam")
 T = {}
 
 # Pipeline stages: togglable via --stages / --skip (names in run order).
-STAGE_ORDER = ["download", "texts", "base", "calibrate", "fit", "refine",
-               "save", "verify", "report"]
-STAGE_DESCR = {
-    "download":  "download   1   source: GGUF resolve/download + light catalog (config+tokenizer)",
-    "texts":     "texts      2   calibration/eval text split + tokenization",
-    "base":      "base       3   base ppl/log-prob cache/demo generation (STREAMING)",
-    "calibrate": "calibrate  4   pair pool + block centroids/geometry (STREAMING)",
-    "fit":       "fit        5   field fit per block (no model in RAM)",
-    "refine":    "refine     5b  self-distillation refit rounds (--refine-rounds; default off)",
-    "save":      "save       6   assemble the artifact STREAMINGLY",
-    "verify":    "verify     7   reload artifact: KL/ppl vs base + demo generation",
-    "report":    "report     8   write reports (artifact README + results/)",
-}
+# Single source of truth: hf_cli.STAGES (does/reads/writes/uses per stage);
+# re-exported here for resolve_plan() and the PLAN printout.
+STAGE_ORDER = hf_cli.STAGE_ORDER
+STAGE_DESCR = hf_cli.STAGE_DESCR
 
 
 def banner(msg):
@@ -319,31 +209,88 @@ def patch_moe_topk(model, k):
     return n
 
 
-def iron_eval_models(base, art, X, Y):
+def force_topk_all(model, k, label=""):
+    """--force-topk (update 11): patch_moe_topk + config.num_experts_per_tok,
+    with a loud print of what the routing was BEFORE the override. The config
+    update matters for whole-run overrides: the fit/geometry code reads
+    num_experts_per_tok, while the forwards read the module attrs."""
+    k = int(k)
+    cfg = getattr(model, "config", None)
+    old_cfg = getattr(cfg, "num_experts_per_tok", None)
+    n_exp = getattr(cfg, "num_experts", None)
+    if n_exp and not 1 <= k <= int(n_exp):
+        sys.exit(f"--force-topk {k} is out of range: the model has "
+                 f"{n_exp} experts")
+    n = patch_moe_topk(model, k)
+    if cfg is not None and isinstance(old_cfg, int):
+        cfg.num_experts_per_tok = k
+    tag = f"[{label}] " if label else ""
+    print(f"FORCE-TOPK {tag}-> k={k} (config had {old_cfg}); "
+          f"routing modules patched: {n}", flush=True)
+    if not n:
+        print("    WARNING: no routing module was patched - the forward may "
+              "read k from a place this override does not reach", flush=True)
+    return n
+
+
+def iron_eval_models(base, art, X, Y, prompt_ids=None):
     """Live base-vs-artifact eval on the eval chunks. The on-disk lp cache is
     NOT usable here (it was built under the original top_k), so the base runs
-    live. Returns (base_ppl, artifact_ppl, kl_bits)."""
+    live.
+    prompt_ids (11.2, probe B): optional 1-D LongTensor prepended to every
+    window as CONTEXT ONLY - the scored targets stay EXACTLY the window's own
+    Y tokens (the slice [m:] re-aligns the logits rows with the unprompted
+    run), so prompted vs unprompted numbers are directly comparable.
+    Returns (base_ppl, artifact_ppl, kl_bits, kl_pos) - kl_pos = per-position
+    bucket KL in bits/token (the "blind at start" probe, free bookkeeping)."""
     import math
     import torch
     import torch.nn.functional as _F
+    from hf_field_transform import kl_pos_accumulate, kl_pos_finish
     base.eval(), art.eval()
     dev = next(art.parameters()).device
+    m = int(prompt_ids.numel()) if prompt_ids is not None else 0
     ces_b, ces_a, kls = [], [], []
+    pos = {}
     with torch.no_grad():
         for x, y in zip(X, Y):
-            xb = x.unsqueeze(0).to(dev)
+            if m:
+                # [prompt | window]: window token t_i sits at row m+i and is
+                # PREDICTED at row m+i-1... in the UNPROMPTED run window token
+                # t_{j+1} is predicted at row j; slicing rows [m:] restores
+                # exactly that alignment (the last row predicts the first
+                # out-of-window token, same as unprompted).
+                xb = torch.cat([prompt_ids.to(x.device), x]) \
+                    .unsqueeze(0).to(dev)
+            else:
+                xb = x.unsqueeze(0).to(dev)
             lb = base(input_ids=xb).logits[0].float()
             la = art(input_ids=xb).logits[0].float()
+            if m:
+                lb, la = lb[m:], la[m:]
             yv = y.to(lb.device)
             ces_b.append(float(_F.cross_entropy(lb, yv)))
             ces_a.append(float(_F.cross_entropy(la, yv)))
             pb = torch.log_softmax(lb, dim=-1)
             pa = torch.log_softmax(la, dim=-1)
-            kls.append(float((pb.exp() * (pb - pa)).sum(-1).mean()))
+            kl_tok = (pb.exp() * (pb - pa)).sum(-1)
+            kls.append(float(kl_tok.mean()))
+            kl_pos_accumulate(pos, kl_tok)
             del lb, la, pb, pa
     ce_b = sum(ces_b) / len(ces_b)
     ce_a = sum(ces_a) / len(ces_a)
-    return math.exp(ce_b), math.exp(ce_a), (sum(kls) / len(kls)) / math.log(2)
+    return (math.exp(ce_b), math.exp(ce_a),
+            (sum(kls) / len(kls)) / math.log(2), kl_pos_finish(pos))
+
+
+def _print_kl_pos(pos, prefix="    KL by position (chunk start):"):
+    """One-line bucket dump of the position-resolved KL (probe A)."""
+    items = [(k, v) for k, v in (pos or {}).items()]
+    if not items:
+        return
+    txt = " | ".join(f"{k}: {v:.3f}" if v is not None else f"{k}: -"
+                     for k, v in items)
+    print(f"{prefix} {txt}", flush=True)
 
 
 def dir_size_gb(p):
@@ -518,15 +465,7 @@ def resolve_plan(args):
     """--stages / --skip / --skip-reload-check -> a validated stage list
     (STAGE_ORDER subset). Also handles --list-stages and the refine defaults."""
     if args.list_stages:
-        print("\nPipeline stages (run order):")
-        for s in STAGE_ORDER:
-            print(f"  {STAGE_DESCR[s]}")
-        print("\ntoggles:")
-        print("  --stages fit,save,verify   run ONLY these stages")
-        print("  --skip base,report         run all EXCEPT these")
-        print("  --skip download            reuse-only: no network/downloads")
-        print("  (--skip-reload-check == --skip verify; a re-run also auto-skips")
-        print("   whatever is already cached: pool, log-probs, fits)")
+        hf_cli.print_stage_table()
         sys.exit(0)
     if args.stages and args.skip:
         sys.exit("use either --stages or --skip, not both")
@@ -667,6 +606,8 @@ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
               flush=True)
     plan = [s for s in STAGE_ORDER if s in plan]
     print(f"\nPLAN: {' -> '.join(plan)}", flush=True)
+    for _s in plan:                     # what each planned stage IS/does
+        print(f"  {STAGE_DESCR[_s]}", flush=True)
     skipped = [s for s in STAGE_ORDER if s not in plan]
     if skipped:
         print(f"skipped: {', '.join(skipped)}", flush=True)
@@ -788,8 +729,11 @@ def print_profile(args, fit, preset):
         ("model", args.model),
         ("quant", "auto" if str(args.gguf_quant).lower() == "auto" else args.gguf_quant),
         ("rank", args.rank),
+        ("banks", getattr(args, "banks", 1)),
         ("fit", f"method={fit['fit_method']} steps={fit['fit_steps']} "
                 f"bs={fit['fit_bs']} lr={fit['fit_lr']}"
+                + (f" train={args.fit_train}"
+                   if getattr(args, "fit_train", None) else "")
                 + (f" preset={preset}" if preset else "")),
         ("fit_workers", args.fit_workers),
         ("fit_jitter", args.fit_jitter),
@@ -797,6 +741,18 @@ def print_profile(args, fit, preset):
         ("muon", f"max_dim={args.muon_max_dim} ns={args.muon_ns_steps}"),
         ("fit_early_stop", args.fit_early_stop),
         ("refine_rounds", args.refine_rounds),
+        ("test_only", getattr(args, "test_only", False)),
+        ("force_topk", getattr(args, "force_topk", 0) or "off"),
+        ("verify_topk", ",".join(map(str, getattr(args, "verify_topk", None) or []))
+         or "off"),
+        ("iron_prompt", getattr(args, "iron_prompt", "") or "off"),
+        ("field_mode", getattr(args, "field_mode", "preact")),
+        # 13.5: make the du-bank visible in the profile line (before this,
+        # a run with --u-mode rank4 was indistinguishable from none in the
+        # header - the drift lines were the only evidence)
+        ("u_mode", (f"{args.u_mode}/r{args.u_rank}"
+                     if getattr(args, "u_mode", "none") in ("rank1", "rank4")
+                     else getattr(args, "u_mode", "none"))),
         ("io_threads", args.io_threads),
         ("prefetch", args.prefetch),
         ("cpu cores", os.cpu_count()),
@@ -819,8 +775,11 @@ def _compat_check():
         "hf_stream": ("BlockStreamRunner",),
         "hf_field_transform": ("_mdev", "fit_field_module",
                                "block_router_bias", "block_shared_weights",
-                               "expert_basis_init", "_resolve_fit_autocast"),
+                               "expert_basis_init", "_resolve_fit_autocast",
+                               "apply_core", "FIELD_ENGINE_VER"),
+        "whbank_build": ("ensure_t2_init", "WHBANK_T2_VER"),
         "hf_gguf_to_hf": ("resolve_gguf",),
+        "hf_cli": ("print_manifest", "build_parser"),
     }
     for mod, names in need.items():
         try:
@@ -835,240 +794,54 @@ def _compat_check():
                      f"(missing: {', '.join(missing)})\n"
                      "[update] this hf_pipeline.py is from the full update "
                      "package - re-copy ALL .py files from it, not just some")
+    # 13.5: symbol checks cannot see INSIDE FieldSparseMoe - the du-bank era
+    # is verified by TEXT markers in the source (a mixed old/new file set
+    # fails fast here, instead of producing "identical init values" mysteries)
+    text_need = {
+        "hf_field_transform.py": ("duAdn", "u_mode"),
+        "modeling_field_template.py": ("u_mode",),
+    }
+    for fname, needles in text_need.items():
+        path = os.path.join(BASE, fname)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                tsrc = f.read()
+        except OSError:
+            sys.exit(f"[update] {fname} is missing - re-copy ALL .py files "
+                     "from the update package")
+        gone = [n for n in needles if n not in tsrc]
+        if gone:
+            sys.exit(f"[update] {fname} is OUTDATED (no marker: "
+                     f"{', '.join(gone)}) - the 13.5 file set requires the "
+                     "du-bank code; re-copy ALL .py files from the update "
+                     "package, not just some")
 
 
 def main():
     _compat_check()
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model",
-                    default="mradermacher/OLMoE-1B-7B-0924-GGUF",
-                    help="HF id (default Q4_K_M GGUF mradermacher; "
-                         "for bf16: allenai/OLMoE-1B-7B-0924)")
-    ap.add_argument("--gguf-quant", default="Q4_K_M",
-                    help="which quant to download from a GGUF repo: "
-                         "Q4_K_M | Q4_K_S | Q3_K_M | Q8_0 | ... | auto "
-                         "(pick the best available)")
-    ap.add_argument("--gguf-file", default=None, help="exact .gguf name in the repo")
-    ap.add_argument("--gguf", default=None,
-                    help="local .gguf file (skip downloading)")
-    ap.add_argument("--gguf-out", default=None,
-                    help="folder for the light catalog / dequant checkpoint")
-    ap.add_argument("--gguf-base-repo", default=None,
-                    help="where to take the exact config/tokenizer from (default: "
-                         "auto-detected from GGUF metadata; empty - build from GGUF)")
-    ap.add_argument("--local-path", default=None, help="path to an already downloaded model")
-    ap.add_argument("--auto", action="store_true",
-                    help="zero-config mode: --gguf-quant auto + the balanced fit "
-                         "preset (explicit flags still win)")
-    ap.add_argument("--rank", type=int, default=32, help="field rank (default 32)")
-    ap.add_argument("--field-mode", default="preact", choices=["preact", "postact"],
-                    help="composition of the field (10.9): preact = one fused "
-                         "pass, coordinates c(z)=z@C mixed BEFORE the "
-                         "nonlinearity (cheapest); postact = per-expert "
-                         "branches, nonlinearity PER EXPERT, outputs mixed "
-                         "with z_e (external review's 'Variant A'; zero "
-                         "SwiGLU cross-term error, ~1 extra down-GEMM per "
-                         "token). Same parameters either way; the probe arm "
-                         "'postact' decides which one to train")
-    ap.add_argument("--out", default=None, help="artifact folder")
-    ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    ap.add_argument("--dtype", default="auto",
-                    choices=["auto", "bfloat16", "float16", "float32"])
-    ap.add_argument("--profile", default="auto", choices=["auto", "low", "high"],
-                    help="hardware profile: auto detects it (CUDA, or 32 GB+ RAM "
-                         "and 8+ cores -> high, else low); high lifts the "
-                         "conservative defaults on a strong box (io-cache ram, "
-                         "io-threads 4, calib-bsz 16 on GPU, fp16 on pre-Ampere "
-                         "GPUs); low = the classic cautious defaults. Explicit "
-                         "--io-cache/--io-threads/--calib-bsz/--dtype always win")
-    ap.add_argument("--calib-file", default=None)
-    ap.add_argument("--eval-file", default=None)
-    ap.add_argument("--calib-dataset", default=None,
-                    help="e.g. wikitext-2-raw-v1 (requires datasets)")
-    ap.add_argument("--text-cap", type=int, default=3_000_000, help="text characters")
-    ap.add_argument("--calib-windows", type=int, default=3)
-    ap.add_argument("--calib-bsz", type=int, default=None,
-                    help="calibration batch size (default: 8, or 16 on a GPU "
-                         "under the high profile)")
-    ap.add_argument("--calib-ctx", type=int, default=512)
-    ap.add_argument("--per-layer-cap", type=int, default=8192)
-    ap.add_argument("--pool-recalibrate", action="store_true",
-                    help="force re-collection when the cached pair pool holds "
-                         "fewer pairs/block than --per-layer-cap (default: keep "
-                         "the cached pool when it is still usable - >= "
-                         "max(4096, 16*rank, cap/2) pairs/block - re-collection "
-                         "is the most expensive stage and OOM-crashes low-RAM "
-                         "boxes)")
-    ap.add_argument("--fit-steps", type=int, default=None,
-                    help="fit steps per block (default: 300, or the preset value)")
-    ap.add_argument("--fit-bs", type=int, default=None,
-                    help="fit batch size (default: 4096, or the preset value)")
-    ap.add_argument("--fit-lr", type=float, default=None,
-                    help="fit learning rate (default: 2e-3, or the preset value)")
-    ap.add_argument("--fit-method", default=None,
-                    help="optimizer: adam | adamw | adam-cosine | rmsprop | "
-                         "muon | muon-cosine (muon: NS-orthogonalized updates "
-                         "for the U*/V* factors, BY-NAME split; C*/router "
-                         "always stay on Adam; default: adam, or the preset "
-                         "value)")
-    ap.add_argument("--fit-autocast", default="auto", choices=["auto", "on", "off"],
-                    help="bf16-autocast fit (params stay fp32, matmuls run "
-                         "bf16 via oneDNN - 1.7-1.8x/step on the toy): auto "
-                         "= the honest real-step probe decides per geometry "
-                         "(8 real steps total, cached; keeps fp32 when bf16 "
-                         "is not faster, e.g. no AMX/AVX512-bf16 ISA)")
-    ap.add_argument("--muon-max-dim", type=int, default=512,
-                    help="muon split gate: a U*/V* factor goes through "
-                         "Newton-Schulz only if min(shape) <= this (raise to "
-                         "let the big centroid matrices join; costs ~40-50%% "
-                         "of the step time on real models)")
-    ap.add_argument("--muon-ns-steps", type=int, default=5,
-                    help="Newton-Schulz iterations per muon update "
-                         "(3 = cheaper/looser, 5 = default)")
-    ap.add_argument("--fit-init", default="svd", choices=["svd", "random"],
-                    help="U,V,C initialization: svd = shared basis of the "
-                         "REAL expert deltas (captures ~50-70%% of the delta "
-                         "energy at step 0 - the toy reaches the old fit's "
-                         "quality in ~3x fewer steps; computed once per rank "
-                         "from the streamed experts); random = the old "
-                         "randn*0.02/zeros")
-    ap.add_argument("--refresh-init", action="store_true",
-                    help="rebuild ONLY the per-rank SVD init files "
-                         "(init_svd_blk*.pt) for an existing pool cache and "
-                         "exit - normally not needed: since 2026-09-05.5 the "
-                         "pipeline detects missing files and rebuilds them "
-                         "automatically before the fit; existing files are "
-                         "kept (delete fit_dir/init_svd_blk*.pt to force)")
-    ap.add_argument("--refresh-refine", action="store_true",
-                    help="ignore the refine round cache (done markers + "
-                         "captured pairs) and redo the refine rounds - use "
-                         "after changing fit settings or when the current "
-                         "fits must be re-taught from scratch")
-    ap.add_argument("--fit-jitter", type=float, default=0.0,
-                    help="Gaussian noise on fit inputs, per-dim std units "
-                         "(variance reduction for a SMALL calibration pool: "
-                         "0.2-0.3 at <8 pairs/dim; at 16+ pairs/dim prefer 0 - "
-                         "the bias outweighs the win, and systematic deploy "
-                         "shift is what --refine-rounds is for; 0 = off)")
-    ap.add_argument("--fit-preset", default=None,
-                    help="fit bundle: fast (~2.5x quicker) | balanced (default "
-                         "quality/speed trade) | quality (slowest, lowest mse)")
-    ap.add_argument("--fit-workers", type=int, default=1,
-                    help="parallel fit workers for independent blocks, the "
-                         "refine refit uses them too (2-4 on a multi-core "
-                         "CPU; 1 = sequential)")
-    ap.add_argument("--fit-early-stop", type=int, default=0,
-                    help="stop each block's fit after 2 consecutive flat mse "
-                         "checkpoints (every N steps, e.g. 50; 0 = off). Saves "
-                         "time on plateauing blocks")
-    ap.add_argument("--fit-guard-warmup", type=int, default=-1,
-                    help="the 2x divergence bail is armed only after this many "
-                         "fit steps: -1 = auto (max(30, steps//10)), 0 = old "
-                         "always-armed behavior. The old guard could abort a "
-                         "block on Adam's normal early overshoot, before the "
-                         "optimizer had time to adapt")
-    ap.add_argument("--strict-fit-guard", action="store_true",
-                    help="old hard end-guard: abort the run when a block's fit "
-                         "mse did not drop at least 2%% below the centroid "
-                         "baseline. Default: warn and ship the best state (a "
-                         "fit that ended WORSE than the baseline still aborts)")
-    ap.add_argument("--fit-lr-warmup", type=int, default=0,
-                    help="linear lr ramp over the first N fit steps - gives "
-                         "Adam time to adapt (0 = off). Useful when blocks "
-                         "stall or diverge at the start")
-    ap.add_argument("--fit-router", default="off", choices=["off", "after", "joint"],
-                    help="let the ORIGINAL router join the rebuild (in place, "
-                         "pairs from disk - no extra artifact memory): after = "
-                         "short anchored polish once the field fit is done; "
-                         "joint = the router trains alongside the field from "
-                         "step 0. The tuned router replaces the gate weight in "
-                         "the artifact. Toy-bench caveat: after a converged fit "
-                         "the router is usually NOT the bottleneck - treat as a "
-                         "cheap diagnostic; --refine-rounds is the stronger lever")
-    ap.add_argument("--router-steps", type=int, default=80,
-                    help="anchored router-polish steps for --fit-router after")
-    ap.add_argument("--router-lr", type=float, default=None,
-                    help="router polish lr (default: the fit lr)")
-    ap.add_argument("--router-anchor", type=float, default=0.03,
-                    help="L2 anchor pulling the router to the original "
-                         "(0 = free router; higher = safer for LM-level drift)")
-    ap.add_argument("--refine-rounds", type=int, default=0,
-                    help="self-distillation rounds after the first fit (try 1-2): "
-                         "a streaming pass where the FIELD model feeds its own "
-                         "outputs forward while the original GGUF experts provide "
-                         "targets, then a warm-started refit. Fixes the compounding "
-                         "error the first fit cannot see (it is calibrated on the "
-                         "BASE model's activations)")
-    ap.add_argument("--io-threads", type=int, default=None,
-                    help="threads for GGUF dequant of expert tensors (2-4 speeds "
-                         "up stage 3-4/6 block reads on a multi-core CPU; "
-                         "default: 1, or 4 under the high profile)")
-    ap.add_argument("--prefetch", type=int, default=1,
-                    help="background prefetch of the next expert block while the "
-                         "current layer computes (default 1; 0 = off, saves ~1 "
-                         "block of RAM)")
-    ap.add_argument("--io-cache", choices=["disk", "ram"], default=None,
-                    help="ram: copy the packed GGUF tensors into RAM on first "
-                         "touch (~= packed file size); later passes (pool "
-                         "collection, refit, artifact write) read nothing from "
-                         "disk - big win on Colab/Drive or HDD (default: auto - "
-                         "disk, or ram under the high profile when the GGUF "
-                         "fits in free RAM)")
-    ap.add_argument("--verify-topk", type=int, default=0,
-                    help="iron test (29.8): after the normal verify, re-run "
-                         "base vs artifact with MoE top_k set to K on BOTH "
-                         "models (K=1 removes the router mixture entirely; "
-                         "if the base<->artifact gap collapses at K=1 but is "
-                         "big at K=2, pre-activation mixing is the bottleneck)")
-    ap.add_argument("--eval-chunks", type=int, default=50)
-    ap.add_argument("--kl-chunks", type=int, default=16)
-    ap.add_argument("--eval-ctx", type=int, default=512)
-    ap.add_argument("--gen-tokens", type=int, default=48)
-    ap.add_argument("--gen-rep-pen", type=float, default=1.15,
-                    help="repetition penalty for the report's demo generations "
-                         "(applied to BOTH base and field; compressed models "
-                         "loop under plain greedy; 1.0 = off)")
-    ap.add_argument("--max-shard", default="4GB")
-    ap.add_argument("--save-backbone", default="keep", choices=["keep", "bf16"],
-                    help="keep - backbone as in the source (Q4 source -> Q4 artifact); "
-                         "bf16 - dequant the backbone (CPU inference of the artifact)")
-    ap.add_argument("--threads", type=int, default=None,
-                    help="limit torch CPU threads (default: all cores; set e.g. 4 "
-                         "to keep the machine responsive)")
-    ap.add_argument("--low-mem", action="store_true",
-                    help="memory-frugal metrics: smaller pair/chunk caps "
-                         "(lower RAM, nearly the same metric quality)")
-    ap.add_argument("--cleanup", action="store_true",
-                    help="after success erase the GGUF too (~4.4 GB); the pool "
-                         "cache and artifact stay (the pool serves new ranks "
-                         "without recalibration)")
-    ap.add_argument("--full-dequant", action="store_true",
-                    help="build a full dequant checkpoint from the GGUF (~14 GB "
-                         "on disk; block reads without dequant - faster on a fast "
-                         "SSD). By default weights are read straight from the GGUF "
-                         "block by block: -14 GB of disk, but ~5 s CPU per block load")
-    ap.add_argument("--keep-dequant", action="store_true",
-                    help="keep the dequant checkpoint after success (by default it "
-                         "deletes itself: the artifact is assembled, and can be "
-                         "rebuilt from the GGUF without re-downloading)")
-    ap.add_argument("--skip-fit-guard", action="store_true",
-                    help="do not abort the run if the field fit failed to beat the "
-                         "centroid baseline (degradation guard)")
-    ap.add_argument("--skip-reload-check", action="store_true",
-                    help="skip the artifact check (same as --skip verify)")
-    ap.add_argument("--stages", default=None, metavar="A,B,...",
-                    help="run ONLY these stages, e.g. fit,save,verify (names: "
-                         "--list-stages). Mutually exclusive with --skip")
-    ap.add_argument("--skip", default=None, metavar="A,B,...",
-                    help="run all stages EXCEPT these, e.g. base,verify,report")
-    ap.add_argument("--list-stages", action="store_true",
-                    help="print the stage table and exit")
-    ap.add_argument("--no-cache-verify", action="store_true",
-                    help="skip the 2-chunk log-prob cache self-check (stage 3)")
-    ap.add_argument("--smoke", action="store_true",
-                    help="mini wiring run: short fit/eval")
+    ap = hf_cli.build_parser(__doc__)
     args = ap.parse_args()
+    if args.version:
+        hf_cli.print_version(BASE)
+        sys.exit(0)
+    if args.list_flags:
+        hf_cli.list_flags()
+        sys.exit(0)
+    hf_cli.print_manifest(BASE)   # WHAT files/versions THIS run executes
+    if args.test_only:
+        if args.stages or args.skip:
+            sys.exit("--test-only cannot be combined with --stages/--skip")
+        args.stages = "texts,base,verify"
+        print("--test-only: plan locked to texts,base,verify (no fit/refine/"
+              "save; the artifact and caches must already exist)", flush=True)
+    if args.verify_topk:
+        try:
+            args.verify_topk = [int(x) for x in str(args.verify_topk).split(",")
+                                if x.strip()]
+        except ValueError:
+            sys.exit("--verify-topk expects comma-separated ints, e.g. 1,4,8")
+        if not args.verify_topk:
+            args.verify_topk = []
     plan = resolve_plan(args)          # may exit (--list-stages / bad names)
     device_hint = "cuda" if (args.device == "cuda"
                              or (args.device == "auto" and _cuda_ok())) else "cpu"
@@ -1088,11 +861,40 @@ def main():
               "same metrics)", flush=True)
     fit, fit_preset = resolve_fit_args(args)
     args.fit_steps, args.fit_bs = fit["fit_steps"], fit["fit_bs"]
+    # 13.1: resolve_fit_args collapses "user did not set" into legacy/preset
+    # values - capture the explicit overrides BEFORE that
+    _user_method = args.fit_method is not None
+    _user_lr = args.fit_lr is not None
     args.fit_lr, args.fit_method = fit["fit_lr"], fit["fit_method"]
+    # 13.1: a bank init (whrank-t2-v1) already captures most of the delta
+    # energy at step 0 - the legacy blind-init optimizer profile (muon/adam
+    # @ 2e-3) kicks a converged point out of its basin within the first
+    # steps (the 2026-09-08 run: every block diverged, artifact KL 2.29).
+    # Unless the user pins the optimizer, t2 runs as a POLISH: adamw @ 1e-4,
+    # 20-step warmup, basis frozen (train=core).
+    if args.bank_init == "t2":
+        _t2 = []
+        if args.fit_train is None:
+            args.fit_train = "core"
+            _t2.append("train=core")
+        if not _user_method and not _user_lr and fit_preset is None \
+                and not args.auto:
+            args.fit_method, args.fit_lr = "adamw", 1e-4
+            if not args.fit_lr_warmup:
+                args.fit_lr_warmup = 20
+            _t2.append("method=adamw lr=1e-4 warmup=20")
+        if _t2:
+            print("t2 polish profile: " + ", ".join(_t2)
+                  + "  (override: --fit-train/--fit-method/--fit-lr/"
+                    "--fit-lr-warmup)", flush=True)
+    else:
+        args.fit_train = args.fit_train or "all"
     # effective router-polish lr (always in scope: refine reuses it even when
     # stage 5 itself was skipped as cached)
     router_lr = args.router_lr if args.router_lr is not None else fit["fit_lr"]
     print_profile(args, fit, fit_preset)
+    print("cmd: python3 hf_pipeline.py " + hf_cli.canonical_command(args),
+          flush=True)
 
     t0 = time.time()
     banner("STAGE 0 - bootstrap (dependencies)")
@@ -1109,12 +911,17 @@ def main():
                                     eval_vs_cache_disk, expert_basis_init,
                                     expert_means, field_accounting,
                                     find_moe_blocks, fit_field_module,
-                                    generate_text, load_pairs_block,
+                                    generate_text, kl_pos_accumulate,
+                                    kl_pos_finish, load_pairs_block,
                                     make_batches, polish_router_module,
                                     router_weight, save_pairs_block,
                                     write_field_artifact, FieldSparseMoe,
-                                    SVD_INIT_VER)
+                                    SVD_INIT_VER, apply_core)
     from hf_stream import BlockStreamRunner
+    import whbank_build
+    svd_ver_want = SVD_INIT_VER + ("+b2" if args.banks >= 2 else "")
+    if args.bank_init == "t2":      # UPDATE-13: the T2 init carries its own
+        svd_ver_want = "whrank-t2-v1"   # svd_ver; stale files rebuild by it
     if args.threads:
         torch.set_num_threads(args.threads)
         print(f"CPU threads limited to: {args.threads}", flush=True)
@@ -1142,10 +949,38 @@ def main():
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_",
                  os.path.basename((args.gguf or args.model).rstrip("/")))[:60]
     pool_dir = os.path.join(DL, f"cache_{tag}")            # calibration pool shared by all ranks
-    fit_dir = os.path.join(pool_dir, f"fit_r{args.rank}")  # fit of a specific rank
+    fit_dir = os.path.join(pool_dir, f"fit_r{args.rank}"
+                           + (f"b{args.banks}" if args.banks > 1 else "")
+                           + ("t2" if args.bank_init == "t2" else "")
+                           + ("duF" if args.u_mode == "full" else
+                              ("du1" if args.u_mode == "rank1" else
+                               (f"du{args.u_rank}"
+                                if args.u_mode == "rank4" else ""))))
+    # fit of a specific rank; banks>=2 (UPDATE-12) keeps a SEPARATE dir so an
+    # --banks 2 run never touches the single-bank fit/init caches; bank-init
+    # t2 (UPDATE-13) gets its own dir too (fit_r<rank>t2) - old fits intact;
+    # u_mode != none (13.5) as well (fit_r<rank>du{1,a,F})
     lp_dir = os.path.join(pool_dir, "lp_base")
+    if args.force_topk:
+        lp_dir = os.path.join(pool_dir, f"lp_base_topk{args.force_topk}")
+        print(f"--force-topk {args.force_topk}: the base log-prob cache goes "
+              f"to {lp_dir} (the native-k cache stays untouched)", flush=True)
     os.makedirs(lp_dir, exist_ok=True)
-    out_dir = args.out or os.path.join(DL, f"field_{tag}_r{args.rank}")
+    # under --force-topk the eval tokens + base log-probs are k-DEPENDENT
+    # (the iron test already treats the native lp cache as top-2-only):
+    # keep the forced-k copies out of the native run's files
+    eval_tokens_path = os.path.join(
+        pool_dir, f"eval_tokens_topk{args.force_topk}.pt" if args.force_topk
+        else "eval_tokens.pt")
+    du_tag = ("" if args.u_mode == "none"
+              else ("duF" if args.u_mode == "full"
+                    else ("du1" if args.u_mode == "rank1"
+                          else f"du{args.u_rank}")))
+    out_dir = args.out or os.path.join(DL, f"field_{tag}_r{args.rank}" + du_tag)
+    if du_tag and not args.out:
+        print(f"--u-mode {args.u_mode}: the artifact dir keys on u_mode -> "
+              f"{out_dir} (a du A/B no longer collides with the none-run)",
+              flush=True)
     T["cache_dir"], T["fit_dir"] = pool_dir, fit_dir
     mp = 0 if args.smoke else args.per_layer_cap
     pool_ks = not getattr(args, "pool_recalibrate", False)
@@ -1288,6 +1123,9 @@ def main():
                                                  keep_smaller=pool_ks,
                                                  min_useful=pool_mu)
     base_pass = "base" in plan and not full_cache
+    if not base_pass and args.force_topk and \
+            not os.path.isfile(eval_tokens_path):
+        base_pass = True       # forced-k cache incomplete: re-stream the base
     calib_pass = ("calibrate" in plan
                   and (not pool_cache
                        or not all(os.path.isfile(os.path.join(pool_dir,
@@ -1308,12 +1146,12 @@ def main():
         stale = [i for i in range(pool_cache)
                  if _svd_file_ver(os.path.join(fit_dir,
                                                f"init_svd_blk{i}.pt"))
-                 != SVD_INIT_VER]
+                 != svd_ver_want]
         svd_heal = bool(stale)
         if svd_heal:
             print(f"SVD init check: {len(stale)}/{pool_cache} "
                   f"init_svd_blk*.pt are missing or built by an older init "
-                  f"algorithm (current: {SVD_INIT_VER}) - a streaming pass "
+                  f"algorithm (current: {svd_ver_want}) - a streaming pass "
                   f"will rebuild them from the expert weights (~minutes: one "
                   f"expert read per block, no model forward). The fit for "
                   f"this rank is re-fitted afterwards.",
@@ -1336,8 +1174,7 @@ def main():
         X = Y = eval_ids = None
         base_m = None
         if full_cache:
-            d = torch.load(os.path.join(pool_dir, "eval_tokens.pt"),
-                           map_location="cpu")
+            d = torch.load(eval_tokens_path, map_location="cpu")
             X, Y, eval_ids = d["X"], d["Y"], d["eval_ids"]
             base_m = base_metrics_from_cache(lp_dir, X, Y)
             print(f"BASE ({base_label()}) (from the log-prob cache): "
@@ -1362,8 +1199,7 @@ def main():
             # cached - take the base metrics + eval tokens from the cache
             # so the verify stage keeps its ppl delta (the model below is
             # loaded for the expert weights only, no forward passes)
-            d = torch.load(os.path.join(pool_dir, "eval_tokens.pt"),
-                           map_location="cpu")
+            d = torch.load(eval_tokens_path, map_location="cpu")
             X, Y, eval_ids = d["X"], d["Y"], d["eval_ids"]
             base_m = base_metrics_from_cache(lp_dir, X, Y)
             print(f"BASE ({base_label()}) (from the log-prob cache): "
@@ -1407,6 +1243,8 @@ def main():
         cfg = model.config
         act = ACT2FN[cfg.hidden_act]      # also needed by the fit when the pairs
                                           # come from the cache (stage 4 skipped)
+        if args.force_topk:
+            force_topk_all(model, args.force_topk, "base")
 
         if base_pass:
             if stream and args.gen_tokens > 12:
@@ -1416,8 +1254,7 @@ def main():
 
             X, Y = eval_logits_cache_disk(model, eval_ids, args.eval_ctx,
                                           args.kl_chunks, lp_dir)
-            torch.save({"X": X, "Y": Y, "eval_ids": eval_ids},
-                       os.path.join(pool_dir, "eval_tokens.pt"))
+            torch.save({"X": X, "Y": Y, "eval_ids": eval_ids}, eval_tokens_path)
             if not args.no_cache_verify:
                 # cache check: 2 chunks suffice for the base (the cache is its own
                 # log-probs; a full check = wasted passes, expensive in streaming)
@@ -1445,6 +1282,9 @@ def main():
                        "(STREAMING, weights - quantized GGUF)")
             blocks = find_moe_blocks(model)
             geoms = [block_geometry(b, cfg) for _, b in blocks]
+            if args.bank_init == "t2":      # UPDATE-13: geom несёт kind ядра
+                for g in geoms:             # в init_blk/cfg.field/рантайм
+                    g["core"] = "dense"
             # art_meta.json is written FIRST (it was written LAST before
             # 2026-09-04.3: any interruption during the silent centroids+SVD
             # loop then invalidated the whole pair pool). It carries only the
@@ -1515,8 +1355,16 @@ def main():
             os.makedirs(fit_dir, exist_ok=True)
 
             def _save_svd_init(i, block, mgu, mdn):
-                basis = expert_basis_init(block, mgu, mdn, args.rank,
-                                          log_prefix=f"block {i}/{len(blocks)}")
+                if args.bank_init == "t2":   # UPDATE-13: Tucker-2 dense core
+                    # из отбелённого whbank (коварации - из кэша пула, сами
+                    # банки t2_k{rank} строятся/кэшируются на лету)
+                    basis = whbank_build.ensure_t2_init(
+                        i, block, mgu, mdn, geoms[i], args.rank, pool_dir,
+                        fit_dir, log_prefix=f"block {i}/{len(blocks)}")
+                else:
+                    basis = expert_basis_init(block, mgu, mdn, args.rank,
+                                              log_prefix=f"block {i}/{len(blocks)}",
+                                              banks=args.banks)
                 ftmp = os.path.join(fit_dir, f"init_svd_blk{i}.pt.tmp")
                 torch.save(basis, ftmp)   # atomic: no torn svd-init file
                 os.replace(ftmp, os.path.join(fit_dir, f"init_svd_blk{i}.pt"))
@@ -1529,7 +1377,7 @@ def main():
                 ipath = os.path.join(pool_dir, f"init_blk{i}.pt")
                 spath = os.path.join(fit_dir, f"init_svd_blk{i}.pt")
                 svd_stale = (args.fit_init == "svd"
-                             and _svd_file_ver(spath) != SVD_INIT_VER)
+                             and _svd_file_ver(spath) != svd_ver_want)
                 if refresh_only and not svd_stale:
                     # resumable --refresh-init: existing files are kept
                     # (stale-version files are rebuilt by the same pass)
@@ -1603,9 +1451,13 @@ def main():
                     stream.close()
                 release_model(model, device)
                 sys.exit(0)
+            # 13.5: also report the SVD-init rebuilds of the same pass -
+            # with a stale init version the old line printed "0 rebuilt,
+            # 23 reused" while 23 SVD files WERE rebuilt in those seconds
             print(f"stage 4 init files: {len(blocks) - inits_reused} rebuilt, "
                   f"{inits_reused} reused "
-                  f"({time.time() - t_stage4:.1f}s total)", flush=True)
+                  + (f"({svd_done} SVD-init rebuilt) " if svd_done else "")
+                  + f"({time.time() - t_stage4:.1f}s total)", flush=True)
 
         print("unloading the backbone - the fit runs without it", flush=True)
         if stream:
@@ -1656,11 +1508,26 @@ def main():
             if sig_svd_ver not in ("corrupt", "mixed"):
                 try:
                     import torch as _t
-                    cap0 = _t.load(svd_files[0], map_location="cpu").get("capture") or {}
+                    _s0 = _t.load(svd_files[0], map_location="cpu")
+                    cap0 = _s0.get("capture") or {}
+                    metric = str(_s0.get("capture_metric",
+                                         "diag coords"))   # UPDATE-13
                     parts = [f"{s} {v * 100:.1f}%" for s, v in cap0.items()]
                     if parts:
-                        print(f"SVD init ({sig_svd_ver}): delta energy captured "
-                              f"at step 0 - " + ", ".join(parts) + " (step-0 "
+                        raw_s = ""
+                        capr = _s0.get("capture_raw") or {}
+                        if capr:
+                            rparts = [f"{s} {v * 100:.1f}%"
+                                      for s, v in capr.items()]
+                            raw_s = (" | честный (Frobenius, без взвешивания "
+                                     "активациями): " + ", ".join(rparts)
+                                     + " (raw << whitened = захват живёт в "
+                                       "выбросах ковариации, а не в том, "
+                                       "что банк «плох»)")
+                        print(f"SVD init ({sig_svd_ver}, {metric}): delta "
+                              "energy captured "
+                              f"at step 0 - " + ", ".join(parts)
+                              + raw_s + " (step-0 "
                               f"mse sits ~(1-capture) x the pure-centroid "
                               f"line; ~1% means the init is effectively "
                               f"blind for this rank)", flush=True)
@@ -1673,12 +1540,15 @@ def main():
                   "the pipeline self-heals this before the fit - if you still "
                   "see this WARNING, check the log above for a failed "
                   "streaming pass.", flush=True)
-        banner(f"STAGE 5 - field fit r={args.rank} on pairs from disk "
+        banner(f"STAGE 5 - field fit r={args.rank}"
+               + (f"b{args.banks}" if args.banks > 1 else "")
+               + " on pairs from disk "
                f"({args.fit_method}, "
                f"{T['fit_init_effective']} init, "
                f"model NOT in RAM)")
         fit_sig = dict(fit_steps=args.fit_steps, fit_bs=args.fit_bs, fit_lr=args.fit_lr,
-                       fit_method=args.fit_method, fit_jitter=args.fit_jitter,
+                       fit_method=args.fit_method, fit_train=args.fit_train,
+                       fit_jitter=args.fit_jitter,
                        fit_early_stop=args.fit_early_stop,
                        fit_router=args.fit_router,
                        router_steps=args.router_steps,
@@ -1693,7 +1563,9 @@ def main():
                        muon_ns_steps=args.muon_ns_steps,
                        init=("svd" if svd_ready else "random"),
                        svd_ver=sig_svd_ver,
+                       banks=args.banks,
                        field_mode=args.field_mode,
+                       u_mode=args.u_mode, u_rank=args.u_rank,
                        pool=[int(n) for _, n in (pairs or [])],
                        preset=fit_preset or "none")
         fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
@@ -1745,11 +1617,15 @@ def main():
                 fit_init = dict(ini)
                 if svd_ready:                       # hole-1: real-delta SVD init
                     fit_init.update(torch.load(svd_files[i], map_location="cpu"))
-                fit_mod = FieldSparseMoe({**ini["geom"],
-                                          "field_mode": args.field_mode},
+                fit_mod = FieldSparseMoe(apply_core(ini["geom"],
+                                                    args.bank_init == "t2")
+                                         | {"field_mode": args.field_mode,
+                                            "u_mode": args.u_mode,
+                                            "u_rank": args.u_rank},
                                          args.rank, gate_w=ini["gw"],
                                          act_fn=act, gate_bias=ini.get("eb"),
                                          shared=ini.get("shared"),
+                                         banks=args.banks,
                                          init=fit_init).to(device)
                 with torch.no_grad():
                     fit_mod.wgud.copy_(ini["mgu"])
@@ -1770,7 +1646,8 @@ def main():
                                        router_anchor=args.router_anchor,
                                        autocast=args.fit_autocast,
                                        muon_max_dim=args.muon_max_dim,
-                                       muon_ns_steps=args.muon_ns_steps)
+                                       muon_ns_steps=args.muon_ns_steps,
+                                       train=args.fit_train)
                 if args.fit_router == "after":
                     pr_stat = polish_router_module(
                         fit_mod, Xi, Yi, args.router_steps, args.fit_bs,
@@ -1954,11 +1831,16 @@ def main():
                     for i in range(n_blocks):
                         ini = torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
                                          map_location="cpu")
-                        fm = FieldSparseMoe({**ini["geom"],
-                                             "field_mode": args.field_mode},
+                        fm = FieldSparseMoe(apply_core(ini["geom"],
+                                                       args.bank_init == "t2")
+                                            | {"field_mode": args.field_mode,
+                                               "u_mode": args.u_mode,
+                                               "u_rank": args.u_rank},
                                             args.rank, gate_w=ini["gw"],
-                                            act_fn=act, gate_bias=ini.get("eb"),
-                                            shared=ini.get("shared"))
+                                            act_fn=act,
+                                            gate_bias=ini.get("eb"),
+                                            shared=ini.get("shared"),
+                                            banks=args.banks)
                         fit = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
                                          map_location="cpu")
                         with torch.no_grad():
@@ -2085,13 +1967,17 @@ def main():
                                          map_location="cpu")
                         prev = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
                                           map_location="cpu")
-                        fit_mod = FieldSparseMoe({**ini["geom"],
-                                                  "field_mode": args.field_mode},
-                                                 args.rank,
-                                                 gate_w=ini["gw"], act_fn=act,
-                                                 gate_bias=ini.get("eb"),
-                                                 shared=ini.get("shared"),
-                                                 init=prev).to(device)
+                        fit_mod = FieldSparseMoe(apply_core(
+                            ini["geom"], args.bank_init == "t2")
+                            | {"field_mode": args.field_mode,
+                               "u_mode": args.u_mode,
+                               "u_rank": args.u_rank},
+                            args.rank,
+                            gate_w=ini["gw"], act_fn=act,
+                            gate_bias=ini.get("eb"),
+                            shared=ini.get("shared"),
+                            banks=args.banks,
+                            init=prev).to(device)
                         if "gw_tuned" in prev:
                             with torch.no_grad():   # keep the tuned router
                                 fit_mod.gw.copy_(prev["gw_tuned"])
@@ -2112,7 +1998,8 @@ def main():
                                                router_anchor=args.router_anchor,
                                                autocast=args.fit_autocast,
                                                muon_max_dim=args.muon_max_dim,
-                                               muon_ns_steps=args.muon_ns_steps)
+                                               muon_ns_steps=args.muon_ns_steps,
+                                               train=args.fit_train)
                         if args.fit_router == "after":
                             pr_stat = polish_router_module(
                                 fit_mod, Xi, Yi, args.router_steps, args.fit_bs,
@@ -2218,7 +2105,8 @@ def main():
             sys.exit("--save-backbone bf16 for a bnb source is not supported in the "
                      "streaming mode: take a GGUF source (it is light anyway)")
         profile = dict(model=args.model, quant=str(args.gguf_quant), rank=args.rank,
-                       field_mode=args.field_mode,
+                       banks=args.banks, field_mode=args.field_mode,
+                       u_mode=args.u_mode, u_rank=args.u_rank,
                        fit_method=args.fit_method, fit_steps=args.fit_steps,
                        fit_bs=args.fit_bs, fit_lr=args.fit_lr,
                        fit_jitter=args.fit_jitter, fit_early_stop=args.fit_early_stop,
@@ -2232,8 +2120,14 @@ def main():
         write_field_artifact(src, out_dir, pool_dir, fit_dir, args.rank, dtype,
                              gguf=light_gguf, profile=profile,
                              io_workers=args.io_threads, io_cache=args.io_cache,
-                             field_mode=args.field_mode)
-        full_b, field_b = field_accounting(geoms, args.rank)
+                             field_mode=args.field_mode, banks=args.banks,
+                             core=("dense" if args.bank_init == "t2"
+                                   else "diag"),
+                             u_mode=args.u_mode, u_rank=args.u_rank)
+        full_b, field_b = field_accounting(
+            geoms, args.rank, banks=args.banks,
+            core=("dense" if args.bank_init == "t2" else "diag"),
+            u_mode=args.u_mode, u_rank=args.u_rank)
         T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
                  ratio=full_b / max(field_b, 1), fit_mses=fit_mses,
                  cache_dir=pool_dir, fit_dir=fit_dir, phased_flow=True,
@@ -2260,12 +2154,13 @@ def main():
             art = AutoModelForCausalLM.from_pretrained(
                 out_dir, dtype=dtype, trust_remote_code=True,
                 low_cpu_mem_usage=True).to(device).eval()
+        if args.force_topk:
+            force_topk_all(art, args.force_topk, "artifact")
         if X is None or Y is None:
             # resumed runs: phase A loaded the eval tokens only when the whole
             # cache was complete - the verify math needs just the tokens, and
             # they are deterministic (fixed-seed chunks saved on disk)
-            d = torch.load(os.path.join(pool_dir, "eval_tokens.pt"),
-                           map_location="cpu")
+            d = torch.load(eval_tokens_path, map_location="cpu")
             X, Y, eval_ids = d["X"], d["Y"], d.get("eval_ids", eval_ids)
         field_m = eval_vs_cache_disk(art, X, Y, lp_dir)
         field_gen = None
@@ -2281,6 +2176,8 @@ def main():
             dpct = None
             print(f"FIELD (artifact) r={args.rank}: KL {field_m['kl_bits']:.3f} bits/token "
                   f"(base ppl not in this run - no delta)", flush=True)
+        _print_kl_pos(field_m.get("kl_pos"),
+                      "  probe A - reference KL by position:")
         if field_gen:
             print("\nGeneration FROM THE ARTIFACT (same base/prompt as above):\n"
                   + field_gen, flush=True)
@@ -2288,55 +2185,147 @@ def main():
               f"(or step2_chat.bat) - it finds the artifact itself", flush=True)
         T.update(base=base_m, field=field_m, ppl_delta=dpct,
                  gen_base=base_gen, gen_field=field_gen)
-        if args.verify_topk and args.verify_topk > 0:
+        if args.verify_topk or args.iron_prompt:
+            ref_k = args.force_topk or 2
+            sweep_txt = (", ".join(str(k) for k in args.verify_topk)
+                         if args.verify_topk else "off (--iron-prompt only)")
             print(flush=True)
-            banner(f"IRON TEST - MoE top_k={args.verify_topk} on BOTH models")
-            print(f"top-2 reference: KL {field_m['kl_bits']:.3f} bits/token, "
-                  f"ppl {field_m['ppl']:.2f}", flush=True)
+            banner(f"IRON TEST - MoE top_k sweep {sweep_txt} on BOTH models")
+            print(f"reference (k={ref_k}"
+                  + (", --force-topk run" if args.force_topk else "")
+                  + f"): KL {field_m['kl_bits']:.3f} bits/token, "
+                  f"ppl {field_m['ppl']:.2f}"
+                  + (f", base ppl {base_m['ppl']:.2f}"
+                     if getattr(base_m, "get", None) and base_m.get("ppl")
+                     else ""), flush=True)
+            _print_kl_pos(field_m.get("kl_pos"))
             try:
-                na = patch_moe_topk(art, args.verify_topk)
-                try:
-                    base1 = BlockStreamRunner(
-                        src, dtype=dtype, device=device, gguf=light_gguf,
-                        prefetch=args.prefetch, io_workers=args.io_threads,
-                        io_cache=args.io_cache)
-                    how = "streaming GGUF dequant"
-                except Exception as e:  # noqa: BLE001
-                    print(f"streaming load failed ({e}) - full-model fallback",
-                          flush=True)
-                    base1 = load_source_model(args, src, dtype, device,
-                                              quantized)
-                    how = "full checkpoint"
-                nb = patch_moe_topk(base1, args.verify_topk)
-                print(f"routing modules patched: artifact {na}, base {nb} "
-                      f"({how})", flush=True)
-                ppl_b1, ppl_a1, kl1 = iron_eval_models(base1, art, X, Y)
-                kl2 = field_m["kl_bits"]
-                ratio = kl1 / max(kl2, 1e-9)
-                print(f"IRON TEST top_k={args.verify_topk}: base ppl "
-                      f"{ppl_b1:.2f} | artifact ppl {ppl_a1:.2f} | KL "
-                      f"{kl1:.3f} bits/token = {100 * ratio:.0f}% of the "
-                      f"top-2 KL", flush=True)
-                if ratio < 0.6:
-                    verdict = ("gap COLLAPSED without the mixture -> "
-                               "pre-activation mixing / SwiGLU cross-terms "
-                               "dominate (H1) -> post-activation composition "
-                               "is the fix (probe arm 'postact' first)")
-                elif ratio > 0.85:
-                    verdict = ("gap PERSISTS at top-1 -> the mixture is NOT "
-                               "the bottleneck; low-rank capacity of the "
-                               "deltas dominates (H2) -> follow probe arm "
-                               "'bank2'")
-                else:
-                    verdict = "mixed picture - both effects contribute"
-                print(f"verdict: {verdict}", flush=True)
-                T["iron_test"] = dict(topk=args.verify_topk, base_ppl=ppl_b1,
-                                      artifact_ppl=ppl_a1, kl_bits=kl1,
-                                      kl_top2=kl2)
-                release_model(base1, device)
+                base1 = None
+                how = ""
+
+                def ensure_base():
+                    nonlocal base1, how
+                    if base1 is not None:
+                        return
+                    try:
+                        base1 = BlockStreamRunner(
+                            src, dtype=dtype, device=device, gguf=light_gguf,
+                            prefetch=args.prefetch, io_workers=args.io_threads,
+                            io_cache=args.io_cache)
+                        how = "streaming GGUF dequant"
+                    except Exception as e:  # noqa: BLE001
+                        print(f"streaming load failed ({e}) - full-model "
+                              f"fallback", flush=True)
+                        base1 = load_source_model(args, src, dtype, device,
+                                                  quantized)
+                        how = "full checkpoint"
+
+                iron_rows = []
+                kl_ref = field_m["kl_bits"]
+
+                # ---- PROBE B (11.2): prompt on/off at the reference k.
+                # Two live passes; the sweep below reuses the loaded base1.
+                # The prompted windows keep EXACTLY the same scored targets,
+                # so the two KLs are directly comparable. A big KL drop under
+                # a prompt = the 'disoriented without a prompt' failure mode
+                # (a harness bug, not a model bug - the fit saw raw chunks).
+                if args.iron_prompt:
+                    ensure_base()
+                    nb = patch_moe_topk(base1, ref_k)
+                    na = patch_moe_topk(art, ref_k)
+                    try:
+                        pids = tokenizer(args.iron_prompt,
+                                         add_special_tokens=True,
+                                         return_tensors="pt")["input_ids"][0] \
+                            .cpu().long()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"prompt probe skipped (tokenizer failed: "
+                              f"{type(e).__name__}: {e})", flush=True)
+                        pids = None
+                    if pids is not None and int(pids.numel()) == 0:
+                        print("prompt probe skipped: empty prompt", flush=True)
+                        pids = None
+                    if pids is not None:
+                        print(f"prompt probe: {int(pids.numel())} prompt tokens "
+                              f"prepended to every eval window (routing "
+                              f"k={ref_k}: artifact {na}, base {nb}, {how})",
+                              flush=True)
+                        ppl_b0, ppl_a0, kl0, pos0 = iron_eval_models(
+                            base1, art, X, Y)
+                        print(f"IRON PROMPT k={ref_k} unprompted: base ppl "
+                              f"{ppl_b0:.2f} | artifact ppl {ppl_a0:.2f} | KL "
+                              f"{kl0:.3f} bits/token", flush=True)
+                        _print_kl_pos(pos0)
+                        ppl_bp, ppl_ap, klp, posp = iron_eval_models(
+                            base1, art, X, Y, prompt_ids=pids)
+                        print(f"IRON PROMPT k={ref_k} prompted  : base ppl "
+                              f"{ppl_bp:.2f} | artifact ppl {ppl_ap:.2f} | KL "
+                              f"{klp:.3f} bits/token", flush=True)
+                        _print_kl_pos(posp)
+                        dp = 100 * (klp - kl0) / max(kl0, 1e-9)
+                        if dp <= -10:
+                            pv = ("the prompt calms the artifact DOWN -> "
+                                  "'disoriented without a prompt' CONFIRMED "
+                                  "(harness defect, the fit saw raw chunks)")
+                        elif dp >= 10:
+                            pv = ("the prompt makes the artifact WORSE -> it "
+                                  "is overfit to the promptless distribution")
+                        else:
+                            pv = ("marginal change - the no-prompt "
+                                  "hypothesis is NOT confirmed")
+                        print(f"prompt probe verdict: {dp:+.0f}% KL -> {pv}",
+                              flush=True)
+                        iron_rows.append(dict(
+                            topk=ref_k, base_ppl=ppl_b0, artifact_ppl=ppl_a0,
+                            kl_bits=kl0, kl_ref=kl_ref,
+                            note="unprompted live (prompt probe reference)"))
+                        iron_rows.append(dict(
+                            topk=ref_k, base_ppl=ppl_bp, artifact_ppl=ppl_ap,
+                            kl_bits=klp, kl_ref=kl_ref,
+                            prompt_tokens=int(pids.numel()),
+                            kl_delta_pct=round(dp, 1), note="prompted"))
+
+                for ks in args.verify_topk:
+                    if ks == ref_k:
+                        print(f"top_k={ks}: equals the reference k - skipped",
+                              flush=True)
+                        continue
+                    na = patch_moe_topk(art, ks)
+                    ensure_base()
+                    nb = patch_moe_topk(base1, ks)
+                    print(f"top_k={ks}: routing modules patched - artifact "
+                          f"{na}, base {nb} ({how})", flush=True)
+                    ppl_b1, ppl_a1, kl1, pos1 = iron_eval_models(base1, art, X, Y)
+                    ratio = kl1 / max(kl_ref, 1e-9)
+                    print(f"IRON TEST top_k={ks}: base ppl "
+                          f"{ppl_b1:.2f} | artifact ppl {ppl_a1:.2f} | KL "
+                          f"{kl1:.3f} bits/token = {100 * ratio:.0f}% of the "
+                          f"k={ref_k} KL", flush=True)
+                    _print_kl_pos(pos1)
+                    if ratio < 0.6:
+                        verdict = ("gap COLLAPSED without the mixture -> "
+                                   "pre-activation mixing / SwiGLU cross-terms "
+                                   "dominate (H1) -> post-activation composition "
+                                   "is the fix (probe arm 'postact' first)")
+                    elif ratio > 0.85:
+                        verdict = ("gap PERSISTS at top-1 -> the mixture is NOT "
+                                   "the bottleneck; low-rank capacity of the "
+                                   "deltas dominates (H2) -> follow probe arm "
+                                   "'bank2'")
+                    else:
+                        verdict = "mixed picture - both effects contribute"
+                    print(f"verdict: {verdict}", flush=True)
+                    iron_rows.append(dict(topk=ks, base_ppl=ppl_b1,
+                                          artifact_ppl=ppl_a1, kl_bits=kl1,
+                                          kl_ref=kl_ref))
+                if iron_rows:
+                    T["iron_tests"] = iron_rows
+                    T["iron_test"] = iron_rows[-1]     # compat: the last K
+                if base1 is not None:
+                    release_model(base1, device)
             except Exception as e:  # noqa: BLE001
                 print(f"iron test failed ({type(e).__name__}: {e}) - the "
-                      f"top-2 results above stand", flush=True)
+                      f"verify results above stand", flush=True)
         release_model(art, device)
 
     banner("PIPELINE FINISHED")
@@ -2388,7 +2377,9 @@ def write_report(args, out_dir):
         md.append(f"Profile: quant {pr.get('quant')} | fit "
                   f"{pr.get('fit_method')}/{pr.get('fit_steps')} steps/"
                   f"bs {pr.get('fit_bs')}/lr {pr.get('fit_lr')}"
-                  f" (preset {pr.get('fit_preset')}) | workers "
+                  + (f"/train {pr.get('fit_train')}"
+                     if pr.get("fit_train") else "")
+                  + f" (preset {pr.get('fit_preset')}) | workers "
                   f"{pr.get('fit_workers')} | prefetch {pr.get('prefetch')}"
                   + (f" | router: {pr.get('fit_router')}"
                      if pr.get("fit_router", "off") != "off" else "")

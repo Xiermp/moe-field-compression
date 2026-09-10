@@ -30,9 +30,9 @@ In-dialog commands:
   /max <n>         - max new tokens per reply
   /exit            - quit
 
-Note: OLMoE-1B-7B-0924 is a base (non-instruct) model. If the artifact has no
-chat_template, the chat falls back to a "Question/Answer" format - coherent,
-but replies match the base model style rather than an assistant.
+Note: if the artifact has no chat_template (GGUF->HF converters often lose
+it), the chat uses the built-in ChatML fallback (SmolLM2-style, the
+NanoColibri template) - override the system prompt with /system as usual.
 """
 import argparse
 import json
@@ -43,6 +43,20 @@ import time
 import hf_env  # noqa: F401  - HF cache inside the project; BEFORE transformers
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+# SmolLM2-style ChatML - the NanoColibri chat template verbatim (model card
+# 2026-09-07). Used when the artifact tokenizer ships without a
+# chat_template: the instruct model otherwise gets raw text and glitches.
+CHATML_FALLBACK = (
+    "{%- for message in messages %}"
+    "{% if loop.first and messages[0]['role'] != 'system' %}"
+    "{{ '<|im_start|>system\\nYou are a helpful AI assistant named SmolLM, "
+    "trained by Hugging Face<|im_end|>\\n' }}{% endif %}"
+    "{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + "
+    "'<|im_end|>' + '\\n'}}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+)
 
 
 def find_artifacts():
@@ -100,10 +114,15 @@ def load_model(path, device, dtype):
 
 
 def build_prompt(tok, history, system):
-    """History -> prompt string: chat template, else Question/Answer fallback."""
-    if getattr(tok, "chat_template", None):
-        msgs = ([{"role": "system", "content": system}] if system else []) + history
-        return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    """History -> prompt string: the tokenizer's chat template, else the
+    built-in ChatML fallback, else the legacy Question/Answer format."""
+    tmpl = getattr(tok, "chat_template", None) or CHATML_FALLBACK
+    msgs = ([{"role": "system", "content": system}] if system else []) + history
+    try:
+        return tok.apply_chat_template(msgs, chat_template=tmpl,
+                                       tokenize=False, add_generation_prompt=True)
+    except Exception:            # malformed custom template -> plain fallback
+        pass
     parts = [system] if system else []
     for m in history:
         who = "Question" if m["role"] == "user" else "Answer"

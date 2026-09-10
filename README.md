@@ -13,27 +13,29 @@ compressed into the field and quality measured by our protocol (KL bits/token,
 Δppl, compression ratio). No fine-tuning of the base model is required or
 included.
 
-## Documentation
+## Documentation (in this package)
 
-Full docs live in the [wiki/](wiki/) folder:
-
-| page | about |
+| source | about |
 |---|---|
-| [wiki/Home.md](wiki/Home.md) | the project card and the ten-minute tour |
-| [wiki/Field-Engine.md](wiki/Field-Engine.md) | the method: formula, what is stored, why it works |
-| [wiki/Pipeline-and-Stages.md](wiki/Pipeline-and-Stages.md) | the 9-stage pipeline and **every stage toggle** |
-| [wiki/Memory-and-Speed.md](wiki/Memory-and-Speed.md) | streaming, `--io-cache ram`, threads, disk layout |
-| [wiki/Quality-and-Calibration.md](wiki/Quality-and-Calibration.md) | the KL protocol, style-drift findings, temperature/min-p fixes |
-| [wiki/Router-Diagnostics.md](wiki/Router-Diagnostics.md) | `router_audit.py` / `router_ft.py` / `field_dims.py` |
-| [wiki/Research-History.md](wiki/Research-History.md) | the experiment ladder with all charts |
-| [wiki/CLI-Reference.md](wiki/CLI-Reference.md) | **every tool, every flag, every default** |
+| `python3 hf_pipeline.py --help` | grouped flags: pick/required vs core vs optional vs tune vs diag |
+| `python3 hf_pipeline.py --list-flags` | **every flag**: required/optional tag, default, full description |
+| `python3 hf_pipeline.py --list-stages` | the 9 stages: does / reads / writes / uses |
+| `python3 hf_pipeline.py --version` | what files/versions THIS run executes (sha256 fingerprints) |
+| [CHANGELOG.md](CHANGELOG.md) | the per-version notes (2026-09-04 .. 2026-09-08), moved out of the code header |
+| [UPDATE-13.5.md](UPDATE-13.5.md) (+ older UPDATE-*.md) | the full per-update write-ups |
+
+Every run also prints a COMPONENT MANIFEST at start (file + version stamp +
+sha256 - so a log always shows WHICH files executed), the stage plan with
+per-stage roles, the effective profile, and `cmd:` - the exact command that
+reproduces the run.
 
 ---
 
 ## Quick start (locally)
 
 ```bash
-pip install -r requirements.txt          # or it auto-installs on first run
+pip install torch                        # the only manual install; stage 0
+                                         # auto-installs everything else
 python3 hf_pipeline.py                   # the WHOLE pipeline in one command
 python3 hf_chat.py                       # chat with the result
 ```
@@ -45,8 +47,8 @@ python3 hf_pipeline.py --auto            # auto-quant + balanced fit preset
 python3 hf_pipeline.py --auto --model mradermacher/NanoColibri-Instruct-GGUF
 ```
 
-Windows: the same two commands via double click - `step1_compress.bat` and
-`step2_chat.bat` (Python must be installed and on PATH).
+Windows: run the same commands in a terminal (use `python` instead of
+`python3`).
 
 What happens:
 1. **A ready Q4 checkpoint is downloaded** - `OLMoE-1B-7B-0924.Q4_K_M.gguf`
@@ -594,13 +596,13 @@ see `modeling_field.py`).
 | `router_ft.py` | surgical gate calibration: gate-only KL fit, anchored; saves `<artifact>_rft` on improvement |
 | `field_dims.py` | artifact accounting one-liner (dims, params, field mix, bytes) |
 | `hf_env.py` | redirects the HF cache into the project (imported first) |
+| `hf_cli.py` | CLI collector: grouped parser, `--list-flags`/`--list-stages`/`--version`, the component manifest |
 | `modeling_field_template.py` | the template of the artifact's modeling code |
-| `step1_compress.bat` / `step2_chat.bat` | double-click launchers on Windows |
 | `make_tiny_olmoe_gguf.py` / `make_tiny_hyv3_gguf.py` | mini-GGUF generators (environment check without a 4 GB download) |
 | `test_stream_mode.py`, `test_gguf_direct.py`, `test_field_fit_guard.py`, `test_io_cache.py`, `test_io_cache_stream.py`, `test_lowram_fix.py` | A/B tests (bit-exact streaming vs full model; GGUF vs checkpoint; fit guard; `--io-cache ram` correctness; LOW-RAM FIX + swap-storm guard: memory-safe dequant, keep-smaller pool, OOM degrade, runner ram-fit re-check, watchdog) |
 | `run_pipeline.sh` + `pipeline.py`, `common.py`, `train.py`, `transform_eval.py`, `variants_eval.py`, `upgrade_eval.py`, `bank_eval.py`, `masks_eval.py`, `field_eval.py`, `deploy.py`, `verify_transformed.py` | toy pipeline: trains a mini-MoE, compresses it, compares against baselines (SVD/PQ/BitDelta/dense) |
 | `examples/toy_report/` | mini-PoC reports and numbers |
-| `wiki/` | the project wiki (method, pipeline, quality findings, research history with charts, CLI reference) |
+| `hf_pipeline.py` --help / --list-flags / --list-stages / --version | the CLI reference, the stage table and the runtime fingerprints (no wiki needed) |
 
 ## Environment check without big downloads
 
