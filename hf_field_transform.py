@@ -1,3 +1,55 @@
+# version: 2026-09-13.3 - ROBUST-HF-LOAD (13.7.1): this file gains
+#   load_hf_model_robust() - a from_pretrained-free load path for SOURCE
+#   models. Why: the transformers 5.x fast-load materializes NON-PERSISTENT
+#   buffers (register_buffer(..., persistent=False), e.g. the freqs_cis
+#   rope table of the deepseek-v4-style custom-code models) from
+#   UNINITIALIZED memory - sporadic per-process NaN logits and
+#   nondeterministic forwards that look like a broken checkpoint (the
+#   nanowhale model card even misdiagnosed it as "bf16 NaN"). Neither
+#   low_cpu_mem_usage=False nor _fast_init=False cures it (measured,
+#   2026-09-13). The robust path instantiates the class DIRECTLY via
+#   from_config (no meta materialization: the buffer value __init__
+#   computes survives), loads the state dict from the snapshot shards
+#   (strict), ties weights, then NaN-GATES every non-persistent buffer.
+#   Verified on nanowhale-100m-base: from_pretrained = garbage buffers in
+#   ~half the processes; robust load = finite buffers + stable ppl 19.58
+#   in 3/3 processes.
+# version: 2026-09-13.1 - DENSE-INIT (13.7): expert_basis_init(core="dense")
+#   keeps the EXACT joint-v2 bases (U, V) and swaps the per-expert diagonal
+#   coordinates for the FULL core C_e = U^T dW_e V (E, r, r) - the Tucker-2
+#   dense core the container has carried since UPDATE-13, now initialized
+#   data-free straight from the projected-delta stash (no whitening, no
+#   calibration pool, +r^2 params per expert: at r=32/64 experts that is
+#   ~131K floats/block against megabytes of experts - the x60 compression
+#   survives). Motivation (zero-shot audit, Task 45/46): the DIAGONAL was the
+#   zero-shot bottleneck - on the same joint-v2 subspace the full core
+#   doubles the captured energy and halves the KL on the toy, and on the
+#   micro-REAL MoE (google/switch-base-8, 6 sparse layers x 8 experts, real
+#   routed activations) it beat the package default EVERYWHERE: activation
+#   error -5.8..-11.2% (up side) / -38.2..-54.4% (down side) across r=8..64.
+#   The best zero-shot init also wins AFTER the fit (same budget: final KL
+#   0.010 vs 0.020 at r=32), so the improvement is not a step-0 curiosity.
+#   default core="diag" is BIT-IDENTICAL to 13.6.x (same bases, same
+#   diagonal values, same svd_ver) - existing caches stay valid; the dense
+#   mode stamps svd_ver "...-dense" and lives in fit_r<rank>dense.
+# version: 2026-09-11.1 - SVD-INIT RANGE FIX (13.6.3): expert_basis_init's
+#   pass-1 range finder accumulated Y = sum_e dW_e @ Omega = (sum_e dW_e) @
+#   Omega - IDENTICALLY ZERO at the mean-centered deltas (expert_means is
+#   the exact arithmetic mean, so sum_e dW_e == 0 by construction): Q was
+#   the QR of fp32 noise, and the whole init (U/V/C, bank-2 residual, the
+#   capture banner) lived on a garbage subspace. The toy: diag capture
+#   0.08-0.11 (noise projection) instead of the achievable 0.45-0.7; step-0
+#   mse 1.7-3x the fixed init; the locked start also explains "step-0 ~
+#   centroid line" runs. FIX: second-moment range finder
+#   Y = sum_e dW_e dW_e^T @ Omega (never degenerate; same streaming
+#   structure, Omega moved to the output side; ~1 extra out.in.q GEMM per
+#   expert). SVD_INIT_VER joint-v1 -> joint-v2: stale cached init files are
+#   rebuilt automatically. Verified on synthetic blocks: subspace capture
+#   1.00 (was ~0.10), diag capture gu 0.082->0.447 / dn 0.109->0.482,
+#   step-0 mse -41% (balanced) / -66% (outlier deltas x4); mean vs median
+#   vs usage-weighted centroids re-tested under the fixed init: the
+#   arithmetic mean stays the best anchor (median's line is 20% worse,
+#   usage-weighted ties it).
 # version: 2026-09-10.1 - DU-BANK (13.5): per-expert deltas on the DOWN
 #   output factor (external review fig12/fig14: the combination dictionary
 #   (coverage) monotonically predicts quality, Spearman -0.94; novelty = 0
@@ -443,9 +495,9 @@ def field_accounting(geoms, rank, banks=1, core="diag", u_mode="none",
 
 
 def apply_core(geom, dense):
-    """UPDATE-13: копия geom с проставленным kind ядра. dense=True ->
-    "dense" (Tucker-2, C (n_exp, r, r)); False -> geom без изменений
-    (старые артефакты/кэши без ключа core остаются диагональными)."""
+    """UPDATE-13: a copy of geom with the core kind set. dense=True ->
+    "dense" (Tucker-2, C (n_exp, r, r)); False -> geom unchanged (old
+    artifacts/caches without the core key stay diagonal)."""
     g = dict(geom)
     if dense:
         g["core"] = "dense"
@@ -467,14 +519,14 @@ class FieldSparseMoe(nn.Module):
         super().__init__()
         self.banks = max(1, int(banks))
         self.core = str(geom.get("core", "diag"))   # UPDATE-13: dense =
-        # Tucker-2: C - ПЛОТНОЕ ядро (n_exp, r, r) вместо диагонали (n_exp, r);
-        # diag (по умолчанию) - прежнее поведение бит-в-бит.
+        # Tucker-2: C is a DENSE core (n_exp, r, r) instead of a diagonal
+        # (n_exp, r); diag (the default) is the previous behavior bit-for-bit.
         d, dff, r = geom["d_model"], geom["d_ff"], rank
         self.d, self.k = d, geom["top_k"]
         self.mode = str(geom.get("field_mode", "preact"))  # 10.9: preact =
-        # смесь координат c(z) ДО нелинейности; postact = per-expert ветки
-        # (нелинейность по эксперту, выход = sum_e z_e*FFN_e) - при top_k=1
-        # обе композиции совпадают точно
+        # coordinates c(z) mixed BEFORE the nonlinearity; postact = per-expert
+        # branches (nonlinearity per expert, output = sum_e z_e*FFN_e) - at
+        # top_k=1 both compositions coincide exactly
         self.norm = geom["norm_topk"]
         self.act_fn = act_fn
         self.router_kind = str(geom.get("router_kind", "softmax"))
@@ -514,8 +566,9 @@ class FieldSparseMoe(nn.Module):
                 nm, nn.Parameter(torch.zeros(c_shape, dtype=dtype)))
             self.field_names.append(nm)
         if self.banks >= 2:          # UPDATE-12: second coordinate bank
-            # банк 2 остаётся ДИАГОНАЛЬНЫМ и в dense-режиме (ядро Tucker-2
-            # уже несёт cross-члены общего базиса; bank-2 - запас на вырост)
+            # bank 2 stays DIAGONAL even in the dense mode (the Tucker-2 core
+            # already carries the shared-basis cross terms; bank 2 is a
+            # growth reserve)
             for nm, out, inp in (("gu", 2 * dff, d), ("dn", d, dff)):
                 self.register_parameter(
                     f"U2{nm}", nn.Parameter(
@@ -667,8 +720,8 @@ class FieldSparseMoe(nn.Module):
                 y = yj if y is None else y + yj
             return y
         if self.core == "dense":                         # UPDATE-13: Tucker-2
-            # смесь ядер: G_mix = sum_e z_e G_e, дельта = U G_mix Vᵀ - два
-            # батч-эйнсама, без per-expert цикла (T*r² флопов на токен)
+            # core mixture: G_mix = sum_e z_e G_e, delta = U G_mix Vᵀ - two
+            # batch-einsums, no per-expert loop (T*r² flops per token)
             gu = x @ self.wgud.t() + torch.einsum(
                 "tkl,tl->tk",
                 torch.einsum("te,ekl->tkl", z, self.Cgu),
@@ -690,10 +743,10 @@ class FieldSparseMoe(nn.Module):
             y = h @ self.wdnd.t() + (h @ self.Vdn * cdn) @ self.Udn.t()
         if self.banks >= 2:                              # UPDATE-12: bank 2
             y = y + (h @ self.V2dn * (z @ self.C2dn)) @ self.U2dn.t()
-        if self.u_mode != "none":                        # 13.5: du-bank поверх
-            zt, ei = z.topk(min(self.k, z.shape[-1]),    # preact: та же
-                            dim=-1)                      # top-k-смесь выхода
-            hv = h @ self.Vdn                            # (h общий -> hv один)
+        if self.u_mode != "none":                        # 13.5: du-bank on top
+            zt, ei = z.topk(min(self.k, z.shape[-1]),    # preact: the same
+                            dim=-1)                      # top-k output mix
+            hv = h @ self.Vdn                            # (h shared -> one hv)
             for j in range(zt.shape[-1]):
                 if self.u_mode == "full":
                     y = y + zt[:, j:j + 1] * torch.matmul(
@@ -1367,6 +1420,101 @@ def _col_means(w):
 
 
 @torch.no_grad()
+def _bad_nonpersistent_buffers(model):
+    """Names of NON-PERSISTENT buffers holding NaN/inf (empty = healthy).
+    These buffers are NOT in any state dict, so a load path that skips or
+    re-materializes __init__ leaves them uninitialized (13.7.1)."""
+    bad = []
+    for mod_name, mod in model.named_modules():
+        nps = getattr(mod, "_non_persistent_buffers_set", None)
+        if not nps:
+            continue
+        own = dict(mod.named_buffers(recurse=False))
+        for bname in nps:
+            buf = own.get(bname)
+            if buf is not None and buf.is_floating_point() \
+                    and not torch.isfinite(buf).all():
+                bad.append(f"{mod_name}.{bname}" if mod_name else bname)
+    return bad
+
+
+def load_hf_model_robust(src, dtype=None, trust_remote_code=True):
+    """from_pretrained-free load for SOURCE models (13.7.1).
+
+    transformers 5.x fast-load can materialize NON-PERSISTENT buffers of
+    custom-code models from uninitialized memory (see the header note):
+    the model then produces sporadic per-process NaN logits that look like
+    a broken checkpoint. Neither low_cpu_mem_usage=False nor
+    _fast_init=False cures it. This path:
+      1. AutoConfig.from_pretrained (trust_remote_code optional);
+      2. instantiates the model class DIRECTLY via from_config - no weight
+         materialization step, so every buffer value __init__ computes
+         survives unchanged;
+      3. resolves the weights (local dir or a hub snapshot), loads every
+         shard into the state dict (safetensors mmap'd, or torch.load for
+         .bin), strict - a mismatch is a loud error, not silent garbage;
+      4. ties weights, then NaN-GATES all non-persistent buffers.
+    dtype follows from_config (a .to(dtype) would double the peak RAM on
+    big models); the caller moves the model to its device as before.
+    Returns the model."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+    cfg = AutoConfig.from_pretrained(src, trust_remote_code=trust_remote_code)
+    kw = {"trust_remote_code": trust_remote_code}
+    try:
+        model = AutoModelForCausalLM.from_config(cfg, dtype=dtype, **kw) \
+            if dtype is not None else \
+            AutoModelForCausalLM.from_config(cfg, **kw)
+    except TypeError:                       # older/newer kwarg spelling
+        model = AutoModelForCausalLM.from_config(cfg, **kw)
+        if dtype is not None:
+            model = model.to(dtype)
+    model.eval()
+
+    import glob as _glob
+    wdir = src if os.path.isdir(src) else None
+    if wdir is None:
+        from huggingface_hub import snapshot_download
+        wdir = snapshot_download(src)
+    shards = sorted(_glob.glob(os.path.join(wdir, "*.safetensors")))
+    sd = {}
+    if shards:
+        from safetensors.torch import load_file
+        for sh in shards:
+            sd.update(load_file(sh))
+    else:
+        bins = sorted(_glob.glob(os.path.join(wdir, "pytorch_model*.bin")))
+        if not bins:
+            raise RuntimeError(f"no weight shards (*.safetensors / "
+                               f"pytorch_model*.bin) under {wdir}")
+        for b in bins:
+            sd.update(torch.load(b, map_location="cpu", weights_only=True))
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
+    # tied weights (e.g. lm_head = embed) legitimately absent from the
+    # checkpoint when the model ties them - from_pretrained allows the same
+    tied = set(getattr(model, "_tied_weights_keys", None) or [])
+    real_missing = [k for k in missing if k not in tied]
+    if unexpected or real_missing:
+        raise RuntimeError(
+            "state dict mismatch for " + str(src)
+            + f": missing={real_missing[:5]}"
+            + (f" (+{len(real_missing)-5} more)"
+               if len(real_missing) > 5 else "")
+            + f" unexpected={list(unexpected)[:5]}"
+            + (f" (+{len(unexpected)-5} more)" if len(unexpected) > 5
+               else ""))
+    bad = _bad_nonpersistent_buffers(model)
+    if bad:
+        raise RuntimeError(
+            "non-persistent buffers contain NaN/inf after load: "
+            + ", ".join(bad[:5])
+            + " - the checkpoint's __init__ did not run on this path; "
+            "refusing to hand over a silently broken model (13.7.1)")
+    return model
+
+
+@torch.no_grad()
 def expert_means(block):
     """Centroids (expert weight means) without the full fp32 stack.
     Returns (m_gu (2dff,d) fp32, m_dn (d,dff) fp32) - the field init.
@@ -1389,8 +1537,13 @@ def expert_means(block):
             g = dequant_weight(pick(e, ("w1", "gate_proj")))
             u = dequant_weight(pick(e, ("w3", "up_proj")))
             d2 = dequant_weight(pick(e, ("w2", "down_proj")))
-            s_gu = torch.cat([g, u], dim=0).sum(0)
-            s_dn = d2.sum(0)
+            # 2026-09-13.2 fix: accumulate the FULL matrices (the former
+            # .sum(0) collapsed them to vectors, so every ModuleList-layout
+            # model (v4 w1/w3/w2) got a (d,)/(dff,) "centroid" and the svd
+            # init crashed / mis-shaped downstream; the batched branch was
+            # unaffected - it returns expert-mean MATRICES via _col_means)
+            s_gu = torch.cat([g, u], dim=0)            # (2dff, d)
+            s_dn = d2                                  # (d, dff)
             mg = s_gu if mg is None else mg + s_gu
             md = s_dn if md is None else md + s_dn
         return mg / n, md / n
@@ -1445,12 +1598,26 @@ def _iter_expert_w(block):
     raise RuntimeError(f"cannot extract experts from {type(exp).__name__}")
 
 
-SVD_INIT_VER = "joint-v1"          # bump when the init algorithm changes:
-                                   # stale-version files are rebuilt on the
-                                   # next run and the fit re-runs (sig)
+SVD_INIT_VER = "joint-v2"          # bump when the DEFAULT (diag) init
+                                   # algorithm changes: stale-version files
+                                   # are rebuilt on the next run and the fit
+                                   # re-runs (sig)
+                                   # joint-v2 (2026-09-11.1): pass-1 second-
+                                   # moment range finder, see header
 FIELD_ENGINE_VER = "update-13-whrank"  # _compat_check keys on this constant:
                                    # its absence dates a sibling file older
                                    # than UPDATE-13 (partial update guard)
+
+
+def svd_init_ver(core="diag", banks=1):
+    """Cache signature of one init VARIANT (13.7). The default diag mode
+    stamps SVD_INIT_VER (+ "+b2" for a 2-bank field) - unchanged since
+    13.6.x, so old caches stay valid; the dense mode appends "-dense" (a
+    private namespace: a dense run never reuses a diag init file and vice
+    versa). hf_pipeline derives svd_ver_want through THIS helper, so the
+    stamp and the file check cannot drift apart."""
+    return (SVD_INIT_VER + ("-dense" if str(core) == "dense" else "")
+            + ("+b2" if int(banks) >= 2 else ""))
 
 
 @torch.no_grad()
@@ -1526,10 +1693,13 @@ def _joint_align_diag(U_B0, V0, B, sweeps=4, power=15, seed=1234):
 
 @torch.no_grad()
 def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
-                      log_prefix="", banks=1):
+                      log_prefix="", banks=1, core="diag"):
     """Shared-basis SVD init for the field parameters from the REAL expert
     deltas (hole 1, UPDATE-10). For each side (gu, dn):
-      pass 1: Y = sum_e dW_e @ Omega        (randomized range finder)
+      pass 1: Y = sum_e dW_e dW_e^T @ Omega  (SECOND-moment randomized range
+              finder; joint-v2. The former first moment sum_e dW_e @ Omega
+              is identically zero at the mean-centered deltas - the deltas
+              cancel EXACTLY, so Y was fp32 noise and Q a garbage subspace)
               Q = orth(Y)                    - output-side subspace
       pass 2: B_e = Q^T dW_e (stashed)      - projected deltas
       U = Q @ topk_eigh(sum B_e B_e^T)       - output-side basis
@@ -1548,24 +1718,38 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
     Streaming: the full expert stack is never materialized (one expert at a
     time), RAM ~= one expert + the B stash. Returns a dict fit for
     FieldSparseMoe(init=...) plus a "capture" diagnostic (share of the
-    per-expert delta energy the rank-r basis reconstructs)."""
+    per-expert delta energy the rank-r basis reconstructs).
+    core (13.7): "diag" (default) - the legacy per-expert diagonal
+      coordinates, bit-identical to 13.6.x; "dense" - the FULL core
+      C_e = U_B^T B_e V (E, r, r) from the SAME stash (zero extra passes,
+      zero extra streaming cost: the K tensor was already computed for the
+      capture_proj diagnostic). The diagonal was the zero-shot bottleneck:
+      on the same basis the full core carries every shared-subspace cross
+      term, which doubled the captured energy on the toy and cut the
+      routed-token activation error by up to -54% on the micro-real MoE.
+      The dense core is the container's Tucker-2 shape (apply_core), so the
+      fit and the artifact need no changes; bank 2 stays DIAGONAL even in
+      the dense mode (the container rule since UPDATE-13), but its residual
+      is computed against the DENSE bank-1 reconstruction."""
     g = torch.Generator().manual_seed(seed)
     mgu, mdn = mgu.float(), mdn.float()
     out_dim_gu, in_dim_gu = mgu.shape
     out_dim_dn, in_dim_dn = mdn.shape
-    # pass 1 - output-side ranges for both sides in ONE streaming pass
+    # pass 1 - output-side ranges for both sides in ONE streaming pass.
+    # joint-v2: SECOND moment (sum dW dW^T) @ Om - the first moment
+    # (sum dW) @ Om cancels identically at the mean-centered deltas.
     q_gu = min(out_dim_gu, rank + oversample)
     q_dn = min(out_dim_dn, rank + oversample)
-    Om_gu = torch.randn(in_dim_gu, q_gu, generator=g) / math.sqrt(q_gu)
-    Om_dn = torch.randn(in_dim_dn, q_dn, generator=g) / math.sqrt(q_dn)
+    Om_gu = torch.randn(out_dim_gu, q_gu, generator=g) / math.sqrt(q_gu)
+    Om_dn = torch.randn(out_dim_dn, q_dn, generator=g) / math.sqrt(q_dn)
     Ygu = torch.zeros(out_dim_gu, q_gu)
     Ydn = torch.zeros(out_dim_dn, q_dn)
     den = {"gu": 0.0, "dn": 0.0}       # sum_e ||dW_e||^2 (true capture denum)
     n_exp = 0
     for wgu, wdn in _iter_expert_w(block):
         dgu, ddn = wgu - mgu, wdn - mdn
-        Ygu += dgu @ Om_gu
-        Ydn += ddn @ Om_dn
+        Ygu += dgu @ (dgu.t() @ Om_gu)
+        Ydn += ddn @ (ddn.t() @ Om_dn)
         den["gu"] += float(dgu.norm() ** 2)
         den["dn"] += float(ddn.norm() ** 2)
         n_exp += 1
@@ -1606,9 +1790,17 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
             U_B, V = U_B0, V0
         U = Q @ U_B
         # coordinates from the stash: U^T dW_e V = U_B^T B_e V (exact within
-        # range(Q), which the oversampled range finder makes negligible)
-        C = torch.stack([torch.diagonal(U_B.t() @ B[e] @ V)
-                         for e in range(n_exp)])
+        # range(Q), which the oversampled range finder makes negligible).
+        # 13.7: K is materialized FIRST and serves both modes - diag keeps
+        # its diagonal (the same VALUES as the old per-expert loop, so the
+        # default stays bit-identical), dense ships K itself as the core.
+        K = torch.stack([U_B.t() @ B[e] @ V for e in range(n_exp)])
+        if core == "dense":
+            C = K                                   # (E, r, r) full core
+        else:
+            C = torch.diagonal(K, dim1=-2, dim2=-1).contiguous()
+            # (E, r) - the same VALUES as the 13.6.x per-expert loop, so the
+            # default stays bit-identical down to the serialized bytes
         init[f"U{side}"], init[f"V{side}"], init[f"C{side}"] = U, V, C
         # TRUE diag capture: energy of the actual diag-coordinate
         # reconstruction (num = sum_e ||C_e||^2) over the full delta energy
@@ -1618,11 +1810,13 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
         # V are trainable - the fit recovers the rest by rotating the bases
         # (toy: diag ~0.3-0.7 at step 0, still 2.8x better heldout after the
         # same step budget than the random init).
-        K = torch.stack([U_B.t() @ B[e] @ V for e in range(n_exp)])
         num = float((C ** 2).sum())
         capture[side] = num / max(den[side], 1e-12)
         init[f"capture_proj_{side}"] = float((K ** 2).sum()) \
             / max(den[side], 1e-12)
+        # (diag: capture = the DIAGONAL share of capture_proj - the legacy
+        # semantics, unchanged; dense: C IS K, so capture == capture_proj
+        # by construction - the core is the full projection)
         if banks >= 2:
             # UPDATE-12 (bank2, greedy residual stage): subtract the bank-1
             # reconstruction from the stashed projected deltas and run the
@@ -1631,7 +1825,9 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
             # residual's SVD capture instead of random.
             R = B.clone()
             for e in range(n_exp):
-                R[e] -= (U_B * C[e].unsqueeze(0)) @ V.t()
+                rec = (U_B @ C[e]) @ V.t() if core == "dense" \
+                    else (U_B * C[e].unsqueeze(0)) @ V.t()
+                R[e] -= rec
             G_out2 = sum(R[e] @ R[e].t() for e in range(n_exp))   # (q,q)
             G_in2 = sum(R[e].t() @ R[e] for e in range(n_exp))    # (in,in)
             U2_B0, _ = _topk_eigh(G_out2, rank, oversample, seed + 3)
@@ -1653,10 +1849,13 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
                 / max(den2, 1e-12)
     init["capture"] = capture
     init["capture2"] = capture2          # UPDATE-12: residual-stage capture
-    init["svd_ver"] = SVD_INIT_VER + ("+b2" if banks >= 2 else "")
+    init["capture_metric"] = ("full core (13.7)" if core == "dense"
+                              else "diag coords")   # what init["capture"] means
+    init["svd_ver"] = svd_init_ver(core, banks)
     init["banks"] = int(banks)
     parts = [f"{s} {capture[s] * 100:.1f}%" for s in ("gu", "dn") if s in capture]
-    print(f"    {log_prefix} svd init ({SVD_INIT_VER}, joint-aligned): "
+    print(f"    {log_prefix} svd init ({init['svd_ver']}, joint-aligned"
+          + (", dense core" if core == "dense" else "") + "): "
           "delta energy captured at step 0 - " + ", ".join(parts), flush=True)
     if banks >= 2 and capture2:
         parts2 = [f"{s} {capture2[s] * 100:.1f}% of the residual"
@@ -1967,8 +2166,8 @@ def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
     # the composition lives in the runtime (template reads cfg.field.field_mode)
     geom["banks"] = int(banks)             # UPDATE-12: runtime registers U2*/C2*
     geom["core"] = str(core)               # UPDATE-13: diag | dense (Tucker-2)
-    geom["u_mode"] = str(u_mode)           # 13.5: du-банк (runtime registers
-    geom["u_rank"] = int(u_rank)           # duAdn/duBdn или duEdn)
+    geom["u_mode"] = str(u_mode)           # 13.5: du-bank (runtime registers
+    geom["u_rank"] = int(u_rank)           # duAdn/duBdn or duEdn)
 
     # ---- config: plain model + auto_map + the field description
     with open(os.path.join(src, "config.json"), encoding="utf-8") as f:

@@ -22,7 +22,7 @@ included.
 | `python3 hf_pipeline.py --list-stages` | the 9 stages: does / reads / writes / uses |
 | `python3 hf_pipeline.py --version` | what files/versions THIS run executes (sha256 fingerprints) |
 | [CHANGELOG.md](CHANGELOG.md) | the per-version notes (2026-09-04 .. 2026-09-08), moved out of the code header |
-| [UPDATE-13.5.md](UPDATE-13.5.md) (+ older UPDATE-*.md) | the full per-update write-ups |
+| [UPDATE-13.7.md](UPDATE-13.7.md) (+ older UPDATE-*.md) | the full per-update write-ups |
 
 Every run also prints a COMPONENT MANIFEST at start (file + version stamp +
 sha256 - so a log always shows WHICH files executed), the stage plan with

@@ -4,6 +4,91 @@ Moved out of the hf_pipeline.py header at 13.6 (2026-09-10.2, CLI-CLARITY):
 the notes below are verbatim, newest first. The newest version notes stay
 in the hf_pipeline.py header. Full per-update write-ups: UPDATE-*.md.
 
+## version: 2026-09-13.3 - 13.7.1: (a) --bank-init default flips svd ->
+    dense (the user-facing goal is maximal zero-shot quality with zero
+    tuning; dense won EVERY zero-shot A/B to date: toy TinyMoE, the
+    micro-real MoE google/switch-base-8, and the third geometry
+    HuggingFaceTB/nanowhale-100m-base - lower weight rel-MSE on all 8
+    layers x ranks 8/16/32 in the Task-47 zero-shot bench; --bank-init svd
+    stays as the bit-identical 13.6.x compat mode). (b) ROBUST-HF-LOAD:
+    load_source_model now loads SOURCE models through load_hf_model_robust
+    (hf_field_transform) instead of the from_pretrained fast path - the
+    fast path materializes NON-PERSISTENT buffers (persistent=False, e.g.
+    the freqs_cis rope table of deepseek-v4-style custom-code models) from
+    UNINITIALIZED memory: sporadic per-process NaN logits and
+    nondeterministic forwards that look like a broken checkpoint (the
+    nanowhale card even misdiagnosed this as "bf16 NaN"; neither
+    low_cpu_mem_usage=False nor _fast_init=False cures it - measured).
+    The robust path instantiates the class directly via from_config (the
+    __init__-computed buffer values survive), loads the snapshot shards
+    strict (tied keys allowed), ties weights and NaN-gates every
+    non-persistent buffer. Verified on nanowhale-100m-base: from_pretrained
+    = garbage buffers in ~half the processes; robust load = finite buffers
+    + stable ppl 19.58 (3/3 processes). New test test_update1371_loadfix
+    (robust round-trip, dtype, the gate, the CLI default).
+
+## version: 2026-09-13.2 - EXPERT-MEANS-FIX: expert_means() on the ModuleList
+    expert layout (per-expert w1/w3/w2 modules, e.g.
+    HuggingFaceTB/nanowhale-100m-base) accumulated .sum(0): the "centroids"
+    came out as vectors (d,)/(dff,) instead of matrices (2dff,d)/(d,dff),
+    so the svd init crashed or mis-shaped on every ModuleList-layout model
+    (the batched gate_up_proj/down_proj path was unaffected). The full
+    matrices are accumulated now; OLMoE-style runs are bit-identical and
+    caches stay valid. Found by the zero-shot init bench on nanowhale; the
+    same bench also surfaced a transformers-5.x fast-init hazard for
+    custom-code models: NON-PERSISTENT buffers (freqs_cis) materialize from
+    uninitialized memory (504 NaN entries -> NaN logits) - recompute such
+    buffers after from_pretrained or load non-fast.
+
+## version: 2026-09-13.1 - DENSE-INIT (13.7): --bank-init dense - the FULL
+    core C_e = U^T dW_e V (E, r, r) on the SAME joint-v2 basis as the
+    legacy diag init (expert_basis_init core="dense"; data-free, straight
+    from the projected-delta stash, zero extra streaming cost). The
+    zero-shot audits (toy TinyMoE + the micro-REAL MoE google/switch-base-8
+    with real routed activations) showed the DIAGONAL was the zero-shot
+    bottleneck: the dense core doubles the captured energy on the same
+    subspace, cuts the routed-activation error by -6..-11% (up side) /
+    -38..-54% (down side) at step 0, and wins AFTER the fit too (equal
+    budget: final KL 0.010 vs 0.020 at r=32). Plumbing: the new
+    svd_init_ver() helper is the single stamp authority ("joint-v2-dense"
+    [+b2]; the default diag namespace "joint-v2" stays bit-identical to
+    13.6.x so old caches remain valid), the geom carries core="dense" from
+    stage 4 on, the fit lives in its own fit_r<rank>dense, the artifact
+    uses the Tucker-2 dense core the container has had since UPDATE-13
+    (bank 2 stays diagonal), field_meta profile stamps bank_init. The t2
+    polish profile is deliberately NOT applied to dense (the init is not
+    converged - the default full-fit profile is the right one). Tests:
+    test_update137_dense.py 17/17; 13.6.4 fit-fresh 12/12, CLI 21/21,
+    13.5 du, 13.4, 13.3, 13.2, 13.1, 13.6.3 rangefix - green.
+
+## version: 2026-09-11.1b - FIT-FRESH (13.6.4): --fit-fresh - the one-flag
+    "refit from scratch": stage 5 (fit) ignores fit_meta.json /
+    fit_partial.json / fit_blk*.pt and refits ALL blocks with the current
+    settings. The per-block resume stays the DEFAULT (a killed fit of
+    hundreds of steps/block never restarts from block 0); the flag is for
+    the deliberate clean refit under the same settings. The calibration
+    pool and init_svd_blk* caches are untouched. Both fit-cache notices now
+    advertise the flag ("pass --fit-fresh ..."), so no more manual fit_r*
+    deletion. hf_cli gains the flag (group "optional - fit: guard & resume",
+    full description in --list-flags); canonical_command emits it when set.
+    Tests: test_update1364_fitfresh.py 12/12 (parser, canonical round-trip,
+    source anchors incl. the unconditional partial_p definition, torch-free
+    --list-flags, functional decision-chain replica); CLI 21/21, 13.5 du,
+    13.1, 13.2, 13.6.3 rangefix - green.
+## version: 2026-09-11.1 - SVD-INIT RANGE FIX (13.6.3): expert_basis_init's
+    pass-1 range finder accumulated Y = sum_e dW_e @ Omega = (sum_e dW_e) @
+    Omega - IDENTICALLY ZERO at the mean-centered deltas (expert_means is
+    the exact arithmetic mean, so sum_e dW_e == 0 by construction): Q was
+    the QR of fp32 noise, and the whole init (U/V/C, bank-2 residual, the
+    capture banner) lived on a garbage subspace. The toy: diag capture
+    0.08-0.11 (noise projection) instead of the achievable 0.45-0.7; step-0
+    mse 1.7-3x the fixed init. FIX: second-moment range finder
+    Y = sum_e dW_e dW_e^T @ Omega (never degenerate). SVD_INIT_VER
+    joint-v1 -> joint-v2: stale cached init files rebuild automatically.
+    Toy verified: subspace capture 1.00 (was ~0.10), diag capture
+    gu 0.082->0.447 / dn 0.109->0.482, step-0 mse -41% (balanced) / -66%
+    (outlier deltas x4); centroid re-test under the fixed init: the
+    arithmetic mean stays the best anchor.
 ## version: 2026-09-08.4 - WH-CHECK (13.3): --fit-train gains "cores" (the
     stricter polish: U*/V* AND centroids w* frozen, only the cores train -
     the external "freeze W0" recipe; A/B vs "core" decides the default);

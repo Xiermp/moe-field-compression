@@ -4,7 +4,8 @@
 
 What is pinned down:
   t1  FLAG PARITY: the grouped parser carries EXACTLY the 76 flags of the old
-      flat argparse block (same names) + the 2 new info flags
+      flat argparse block (same names) + the 2 new info flags + --fit-fresh
+      (13.6.4)
   t2  DEFAULT/CHOICES parity for every flag whose default is not None
       (spot-hardcoded from the pre-refactor parser)
   t3  parse of a real command: dests land where the pipeline expects them;
@@ -57,7 +58,8 @@ OLD_FLAGS = set("""--model --gguf-quant --gguf-file --gguf --gguf-out
 # dest -> expected default (non-None defaults of the old parser)
 OLD_DEFAULTS = {
     "model": "mradermacher/OLMoE-1B-7B-0924-GGUF", "gguf_quant": "Q4_K_M",
-    "rank": 32, "banks": 1, "bank_init": "svd", "field_mode": "preact",
+    "rank": 32, "banks": 1, "bank_init": "dense",  # 13.7.1: dense default
+    "field_mode": "preact",
     "u_mode": "none", "u_rank": 4, "device": "auto", "dtype": "auto",
     "profile": "auto", "text_cap": 3_000_000, "calib_windows": 3,
     "calib_ctx": 512, "per_layer_cap": 8192, "fit_init": "svd",
@@ -71,7 +73,7 @@ OLD_DEFAULTS = {
     "fit_autocast": "auto",
 }
 OLD_CHOICES = {
-    "banks": (1, 2), "bank_init": ["svd", "t2"],
+    "banks": (1, 2), "bank_init": ["svd", "t2", "dense"],
     "field_mode": ["preact", "postact"],
     "u_mode": ["none", "rank1", "rank4", "full"],
     "device": ["auto", "cuda", "cpu"],
@@ -89,7 +91,7 @@ def main():
     # t1: flag parity --------------------------------------------------------
     got = {a.option_strings[0] for a in ap._actions if a.option_strings} \
           - {"-h", "--help"}
-    new_flags = {"--list-flags", "--version"}
+    new_flags = {"--list-flags", "--version", "--fit-fresh"}
     ok(got == OLD_FLAGS | new_flags,
        "t1 flag parity: %d flags, old 76 all present, extras = %s"
        % (len(got), sorted(got - OLD_FLAGS)))
@@ -107,11 +109,12 @@ def main():
     # t3: parse behavior ------------------------------------------------------
     a = ap.parse_args(["--rank", "64", "--u-mode", "rank4", "--u-rank", "2",
                        "--stages", "fit,save,verify", "--verify-topk", "1,4",
-                       "--fit-method", "muon", "--banks", "2", "--auto"])
+                       "--fit-method", "muon", "--banks", "2", "--auto",
+                       "--fit-fresh"])
     ok(a.rank == 64 and a.u_mode == "rank4" and a.u_rank == 2
        and a.stages == "fit,save,verify" and a.banks == 2 and a.auto
-       and a.fit_train is None and a.out is None,
-       "t3 parse: dests match the old layout")
+       and a.fit_train is None and a.out is None and a.fit_fresh,
+       "t3 parse: dests match the old layout (+ --fit-fresh)")
     for bad_argv in (["--rank", "x"], ["--u-mode", "rank8"], ["--banks", "3"]):
         try:
             ap.parse_args(bad_argv)
@@ -126,7 +129,7 @@ def main():
     ok(f["sha"] == hashlib.sha256(raw).hexdigest()[:12],
        "t4 sha256 matches a direct hashlib pass")
     vers = dict(kv.split("=", 1) for kv in f["vers"])
-    ok(vers.get("SVD_INIT_VER") == "joint-v1"
+    ok(vers.get("SVD_INIT_VER") == "joint-v2"
        and vers.get("FIELD_ENGINE_VER") == "update-13-whrank",
        "t4b VER constants scraped from source: %s" % vers)
     wb = dict(kv.split("=", 1)

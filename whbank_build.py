@@ -225,8 +225,8 @@ def ensure_cov(i, mgu, pool_dir, whdir, geom, force=False, act=None,
                                  z[side + "_Sy12"], z[side + "_Sy_i"])
             out["_N"] = int(z["N"])
             return out
-        print("  cov blk%d: damp в кэше (%s·%s) != запрошенному (%s·%s) - "
-              "пересчёт факторов" % (i, st_damp, st_base, damp_frac, damp_base),
+        print("  cov blk%d: cached damp (%s·%s) != requested (%s·%s) - "
+              "recomputing the factors" % (i, st_damp, st_base, damp_frac, damp_base),
               flush=True)
     import torch
     d = torch.load(_pairs_path(pool_dir, i), map_location="cpu")
@@ -234,13 +234,13 @@ def ensure_cov(i, mgu, pool_dir, whdir, geom, force=False, act=None,
     if int(X.shape[0]) == 0:
         raise SystemExit("whbank_build: pairs_blk%d.pt пуст - сначала пул "
                          "(stage 2-3 пайплайна)" % i)
-    t0 = time.time()
+    t0 = time.perf_counter()
     covs = compute_covs(X, Y, mgu if torch.is_tensor(mgu)
                         else torch.tensor(np.asarray(mgu, dtype=np.float32)),
                         act=act)
     if act != "silu":
-        print("  WARNING: hidden_act=%r не silu - вход dn не отбеливается "
-              "(Cx_dn = I)" % act, flush=True)
+        print("  WARNING: hidden_act=%r is not silu - the dn input is not "
+              "whitened (Cx_dn = I)" % act, flush=True)
         covs["Cx_dn"] = np.eye(covs["Cx_dn"].shape[0])
     fac = {}
     for side in ("gu", "dn"):
@@ -255,8 +255,8 @@ def ensure_cov(i, mgu, pool_dir, whdir, geom, force=False, act=None,
                          sqrtm_psd(Cy).astype(FP),
                          inv_sqrt(Cy, eps_abs=max(damp_frac * by, 1e-30))
                          .astype(FP))
-        print("  cov blk%d/%s: демпфер inv_sqrt eps = %.3g(x) / %.3g(y) "
-              "(база %s, потолок усиления ~%.0fх / ~%.0fх)"
+        print("  cov blk%d/%s: inv_sqrt damper eps = %.3g(x) / %.3g(y) "
+              "(base %s, gain ceiling ~%.0fx / ~%.0fx)"
               % (i, side, damp_frac * bx, damp_frac * by,
                  "mean(diag)" if damp_base == "mean-diag" else "λmax",
                  1.0 / np.sqrt(max(damp_frac * bx, 1e-30)),
@@ -270,8 +270,8 @@ def ensure_cov(i, mgu, pool_dir, whdir, geom, force=False, act=None,
                  dn_Sx12=fac["dn"].Sx12, dn_Sx_i=fac["dn"].Sx_i,
                  dn_Sy12=fac["dn"].Sy12, dn_Sy_i=fac["dn"].Sy_i)
     os.replace(tmp, path)
-    print("  cov blk%d: факторы отбеливания посчитаны и закэшированы "
-          "(%.1fs)" % (i, time.time() - t0), flush=True)
+    print("  cov blk%d: whitening factors computed and cached "
+          "(%.1fs)" % (i, time.perf_counter() - t0), flush=True)
     fac["_N"] = covs["N"]
     return fac
 
@@ -696,8 +696,8 @@ def ensure_t2_init(i, block, mgu, mdn, geom, rank, pool_dir, fit_dir,
         whdir, "t2_k%d" % rank, "blk%02d_%s.npz" % (i, kind)))
         for kind in ("gu", "dn"))
     if need:
-        print("    %s whbank: строю t2_k%d (2 стриминг-прохода по экспертам)..."
-              % (log_prefix, rank), flush=True)
+        print("    %s whbank: building t2_k%d (2 streaming passes over the "
+              "experts)..." % (log_prefix, rank), flush=True)
         build_block_t2(i, block, mgu, mdn, geom, covs, ks=[int(rank)],
                        dia_d=None, whdir=whdir)
     return t2_init_dict(i, geom, int(rank), whdir)

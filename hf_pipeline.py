@@ -1,4 +1,54 @@
-# version: 2026-09-10.2 - CLI-CLARITY (13.6): the command line rebuilt around
+# version: 2026-09-13.3 - ROBUST-HF-LOAD (13.7.1) + DENSE-DEFAULT lives in
+#   hf_cli. load_source_model now loads SOURCE models through the new
+#   load_hf_model_robust() (hf_field_transform): the transformers 5.x
+#   fast-load can leave NON-PERSISTENT buffers of custom-code models
+#   UNINITIALIZED (sporadic per-process NaN logits that look like a broken
+#   checkpoint; measured on HuggingFaceTB/nanowhale-100m-base - neither
+#   low_cpu_mem_usage=False nor _fast_init=False cures it). The robust path
+#   instantiates the class directly (from_config, so __init__-computed
+#   buffer values survive), loads the snapshot shards strict, ties weights
+#   and NaN-gates the non-persistent buffers. The quantized branch keeps
+#   from_pretrained (accelerate device_map). Version history:
+# version: 2026-09-13.2 - EXPERT-MEANS-FIX: expert_means() on the
+#   ModuleList expert layout (v4-style per-expert w1/w3/w2 modules, e.g.
+#   HuggingFaceTB/nanowhale-100m-base) accumulated .sum(0) - the "centroids"
+#   came out as VECTORS (d,)/(dff,) instead of matrices (2dff,d)/(d,dff),
+#   so the svd init crashed or mis-shaped on every ModuleList-layout model.
+#   The full matrices are accumulated now; the batched gate_up_proj /
+#   down_proj path (OLMoE GGUF) is untouched and stays bit-identical, so
+#   existing init/fit caches remain valid. Found by the zero-shot init
+#   bench on nanowhale (the first ModuleList-layout model the path met).
+# version: 2026-09-13.1 - DENSE-INIT (13.7): --bank-init dense - the FULL
+#   core C_e = U^T dW_e V (E, r, r) on the SAME joint-v2 basis as the legacy
+#   diag init (expert_basis_init core="dense", data-free, straight from the
+#   projected-delta stash). The zero-shot audits (toy + micro-real MoE
+#   google/switch-base-8) showed the DIAGONAL was the zero-shot bottleneck:
+#   the dense core cuts the routed-token activation error by up to -54% at
+#   step 0 and wins after the fit too (same budget). Plumbing: svd_ver_want
+#   "joint-v2-dense" via the new svd_init_ver() helper (stamp and file check
+#   cannot drift), the geom carries core="dense" from stage 4 on, the fit
+#   lives in its own fit_r<rank>dense (old caches untouched), the fit and
+#   the artifact use the Tucker-2 dense core the container has had since
+#   UPDATE-13, field_meta profile stamps bank_init. The t2 polish profile is
+#   NOT applied to dense (its init is not converged - the default full fit
+#   profile is the right one); the default --bank-init svd stays
+#   bit-identical to 13.6.x.
+# version: 2026-09-11.1 - FIT-FRESH (13.6.4): --fit-fresh makes stage 5
+#   (fit) ignore every cached fit result (fit_meta.json / fit_partial.json /
+#   fit_blk*.pt) and refit ALL blocks from scratch with the current
+#   settings. The per-block resume stays the DEFAULT (it exists so a killed
+#   fit of hundreds of steps/block never restarts from block 0) - the flag
+#   is for the deliberate clean refit. Both fit-cache notices now advertise
+#   the flag; the calibration pool and init_svd_blk* caches are untouched.
+# version: 2026-09-10.3 - K-POOL-GUARD (13.6.2): a loud guard for the
+#   --force-topk regime: the pair pool is ALWAYS collected at the NATIVE
+#   routing k (calibrate never patches k; the field is fitted on native-k
+#   pairs only), while --force-topk N streams the base and verifies the
+#   artifact at k=N - the iron-test regime, not a k=N artifact. A forced-k
+#   run reusing a native-k pool now prints an explicit WARNING before the
+#   expensive stages, and art_meta.json stamps the pool's collection k.
+#   Everything below is the 13.6 CLI-CLARITY note (details also in
+#   CHANGELOG.md): the command line rebuilt around
 #   hf_cli.py (the CLI collector): (1) a COMPONENT MANIFEST is printed on
 #   every run - each runtime file with its version stamp and a sha256
 #   fingerprint (a log always shows WHICH files executed; shadow copies on
@@ -179,8 +229,13 @@ def load_source_model(args, src, dtype, device, quantized):
     if quantized:
         return AutoModelForCausalLM.from_pretrained(
             src, device_map={"": 0}, low_cpu_mem_usage=True).eval()
-    m = AutoModelForCausalLM.from_pretrained(src, dtype=dtype,
-                                             low_cpu_mem_usage=True)
+    # 13.7.1: the ROBUST load (load_hf_model_robust) replaces the
+    # from_pretrained fast path - it leaves NON-PERSISTENT buffers of
+    # custom-code models UNINITIALIZED (sporadic NaN logits, see
+    # load_hf_model_robust / the hf_field_transform header). The robust
+    # path is strict + NaN-gated; native-arch models load identically
+    # (same config/class resolution, same shard files).
+    m = load_hf_model_robust(src, dtype=dtype)
     return m.to(device).eval()
 
 
@@ -913,15 +968,17 @@ def main():
                                     find_moe_blocks, fit_field_module,
                                     generate_text, kl_pos_accumulate,
                                     kl_pos_finish, load_pairs_block,
-                                    make_batches, polish_router_module,
+                                    load_hf_model_robust, make_batches, polish_router_module,
                                     router_weight, save_pairs_block,
                                     write_field_artifact, FieldSparseMoe,
-                                    SVD_INIT_VER, apply_core)
+                                    SVD_INIT_VER, apply_core, svd_init_ver)
     from hf_stream import BlockStreamRunner
     import whbank_build
-    svd_ver_want = SVD_INIT_VER + ("+b2" if args.banks >= 2 else "")
+    svd_ver_want = svd_init_ver("diag", args.banks)
     if args.bank_init == "t2":      # UPDATE-13: the T2 init carries its own
         svd_ver_want = "whrank-t2-v1"   # svd_ver; stale files rebuild by it
+    elif args.bank_init == "dense":  # 13.7: full-core mode, private namespace
+        svd_ver_want = svd_init_ver("dense", args.banks)
     if args.threads:
         torch.set_num_threads(args.threads)
         print(f"CPU threads limited to: {args.threads}", flush=True)
@@ -951,14 +1008,15 @@ def main():
     pool_dir = os.path.join(DL, f"cache_{tag}")            # calibration pool shared by all ranks
     fit_dir = os.path.join(pool_dir, f"fit_r{args.rank}"
                            + (f"b{args.banks}" if args.banks > 1 else "")
-                           + ("t2" if args.bank_init == "t2" else "")
+                           + {"t2": "t2", "dense": "dense"}.get(args.bank_init, "")
                            + ("duF" if args.u_mode == "full" else
                               ("du1" if args.u_mode == "rank1" else
                                (f"du{args.u_rank}"
                                 if args.u_mode == "rank4" else ""))))
     # fit of a specific rank; banks>=2 (UPDATE-12) keeps a SEPARATE dir so an
     # --banks 2 run never touches the single-bank fit/init caches; bank-init
-    # t2 (UPDATE-13) gets its own dir too (fit_r<rank>t2) - old fits intact;
+    # t2 (UPDATE-13) gets its own dir too (fit_r<rank>t2), the dense core
+    # mode (13.7, fit_r<rank>dense) as well - old fits intact;
     # u_mode != none (13.5) as well (fit_r<rank>du{1,a,F})
     lp_dir = os.path.join(pool_dir, "lp_base")
     if args.force_topk:
@@ -1122,6 +1180,31 @@ def main():
     pool_cache = pairs_cache or pool_is_complete(pool_dir, min_pairs=mp,
                                                  keep_smaller=pool_ks,
                                                  min_useful=pool_mu)
+    # 13.6.2: the pair pool is ROUTING-k dependent (Y = the MoE outputs at
+    # the active top-k; block i>0 inputs shift with earlier blocks' outputs),
+    # but the calibrate stage always collects at the NATIVE k - force_topk
+    # patches only the base (stage 3) and the verify (stage 7). A forced-k
+    # run that reuses a native-k pool is the IRON-TEST regime (the field is
+    # verified on a routing regime it was never fitted for) - say so LOUDLY,
+    # before hours of streaming make the surprise expensive.
+    if pool_cache and getattr(args, "force_topk", 0):
+        _pool_k = 0                            # pre-13.6.2 pool = native k
+        try:
+            with open(os.path.join(pool_dir, "art_meta.json"),
+                      encoding="utf-8") as _f:
+                _pool_k = int((json.load(_f).get("force_topk") or 0))
+        except Exception:                      # noqa: BLE001
+            pass
+        if not _pool_k:
+            print(f"WARNING: --force-topk {args.force_topk}: the cached pair "
+                  f"pool was collected at the NATIVE routing k (calibrate "
+                  f"never patches k; the field is fitted on native-k pairs "
+                  f"only). This run streams the base and verifies the "
+                  f"artifact at k={args.force_topk} - the iron-test regime, "
+                  f"NOT a k={args.force_topk} artifact. For a native-k run "
+                  f"drop --force-topk; for the iron sweep on a finished "
+                  f"artifact prefer --test-only --verify-topk 1,4,8.",
+                  flush=True)
     base_pass = "base" in plan and not full_cache
     if not base_pass and args.force_topk and \
             not os.path.isfile(eval_tokens_path):
@@ -1282,8 +1365,8 @@ def main():
                        "(STREAMING, weights - quantized GGUF)")
             blocks = find_moe_blocks(model)
             geoms = [block_geometry(b, cfg) for _, b in blocks]
-            if args.bank_init == "t2":      # UPDATE-13: geom несёт kind ядра
-                for g in geoms:             # в init_blk/cfg.field/рантайм
+            if args.bank_init in ("t2", "dense"):      # UPDATE-13/13.7: geom
+                for g in geoms:             # carries the core kind (init_blk/cfg.field/runtime)
                     g["core"] = "dense"
             # art_meta.json is written FIRST (it was written LAST before
             # 2026-09-04.3: any interruption during the silent centroids+SVD
@@ -1298,7 +1381,11 @@ def main():
                     router_cls=type(blocks[0][1].gate).__name__,
                     router_mod=type(blocks[0][1].gate).__module__,
                     n_layers=len(blocks),
-                    block_names=[n for n, _ in blocks]))
+                    block_names=[n for n, _ in blocks],
+                    # 13.6.2: the k the pool was collected under (calibrate
+                    # never patches k -> native; a future forced-k collection
+                    # would stamp its k here and silence the K-POOL-GUARD)
+                    force_topk=int(getattr(args, "force_topk", 0) or 0)))
             if refresh_only:
                 pairs = []
                 for i in range(pairs_cache):
@@ -1356,15 +1443,17 @@ def main():
 
             def _save_svd_init(i, block, mgu, mdn):
                 if args.bank_init == "t2":   # UPDATE-13: Tucker-2 dense core
-                    # из отбелённого whbank (коварации - из кэша пула, сами
-                    # банки t2_k{rank} строятся/кэшируются на лету)
+                    # from the whitened whbank (covs from the pool cache, the
+                    # t2_k{rank} banks themselves are built/cached on the fly)
                     basis = whbank_build.ensure_t2_init(
                         i, block, mgu, mdn, geoms[i], args.rank, pool_dir,
                         fit_dir, log_prefix=f"block {i}/{len(blocks)}")
                 else:
                     basis = expert_basis_init(block, mgu, mdn, args.rank,
                                               log_prefix=f"block {i}/{len(blocks)}",
-                                              banks=args.banks)
+                                              banks=args.banks,
+                                              core=("dense" if args.bank_init == "dense"
+                                                    else "diag"))
                 ftmp = os.path.join(fit_dir, f"init_svd_blk{i}.pt.tmp")
                 torch.save(basis, ftmp)   # atomic: no torn svd-init file
                 os.replace(ftmp, os.path.join(fit_dir, f"init_svd_blk{i}.pt"))
@@ -1519,18 +1608,20 @@ def main():
                         if capr:
                             rparts = [f"{s} {v * 100:.1f}%"
                                       for s, v in capr.items()]
-                            raw_s = (" | честный (Frobenius, без взвешивания "
-                                     "активациями): " + ", ".join(rparts)
-                                     + " (raw << whitened = захват живёт в "
-                                       "выбросах ковариации, а не в том, "
-                                       "что банк «плох»)")
+                            raw_s = (" | honest (plain Frobenius, "
+                                     "activation-unweighted): "
+                                     + ", ".join(rparts)
+                                     + " (raw << whitened = the delta's raw "
+                                       "norm lives in covariance outliers, "
+                                       "not a sign the bank is bad)")
                         print(f"SVD init ({sig_svd_ver}, {metric}): delta "
                               "energy captured "
                               f"at step 0 - " + ", ".join(parts)
-                              + raw_s + " (step-0 "
-                              f"mse sits ~(1-capture) x the pure-centroid "
-                              f"line; ~1% means the init is effectively "
-                              f"blind for this rank)", flush=True)
+                              + raw_s + " (the ~(1-capture) x "
+                              f"pure-centroid-line rule keys on the WHITENED "
+                              f"capture only; the honest number never enters "
+                              f"the mse - ~1% WHITENED is what a blind init "
+                              f"looks like)", flush=True)
                 except Exception:                          # noqa: BLE001
                     pass
         if args.fit_init == "svd" and not svd_ready:
@@ -1569,18 +1660,28 @@ def main():
                        pool=[int(n) for _, n in (pairs or [])],
                        preset=fit_preset or "none")
         fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
+        partial_p = os.path.join(fit_dir, "fit_partial.json")
         fit_done = fit_blocks_ok(fit_dir, n_blocks) and os.path.isfile(fit_meta_p)
         if fit_done:
             with open(fit_meta_p, encoding="utf-8") as f:
                 fit_done = json.load(f) == fit_sig
+        # --fit-fresh (13.6.4): the deliberate clean refit - pretend there is
+        # no fit cache at all (fit_meta.json / fit_partial.json / fit_blk*.pt);
+        # the pool and the SVD-init caches are NOT part of the fit cache
+        if args.fit_fresh and (fit_done or fit_blocks_ok(fit_dir, n_blocks)):
+            n_cached = sum(1 for i in range(n_blocks)
+                           if os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
+                           and os.path.getsize(os.path.join(fit_dir, f"fit_blk{i}.pt")) > 0)
+            print(f"--fit-fresh: ignoring the cached fit ({n_cached}/{n_blocks} "
+                  f"blocks on disk) - refitting ALL {n_blocks} blocks from "
+                  "scratch", flush=True)
+            fit_done = False
         # per-block resume: fit_partial.json carries {sig, mse{i}} for the
         # blocks whose fit_blk{i}.pt was fully written by an interrupted run;
         # only the missing blocks are re-fitted (a fit of hundreds of steps
         # per block must never restart from block 0 after a kill)
         part_mse = {}
-        if not fit_done:
-            partial_p = os.path.join(fit_dir, "fit_partial.json")
-
+        if not fit_done and not args.fit_fresh:
             def _blk_ok(i):
                 p = os.path.join(fit_dir, f"fit_blk{i}.pt")
                 return os.path.isfile(p) and os.path.getsize(p) > 0
@@ -1595,13 +1696,16 @@ def main():
                         if part_mse:
                             print(f"fit resume: {len(part_mse)}/{n_blocks} "
                                   f"blocks were already fitted with the same "
-                                  f"settings - reusing their fit_blk*.pt",
+                                  f"settings - reusing their fit_blk*.pt "
+                                  f"(pass --fit-fresh to refit everything "
+                                  f"from scratch)",
                                   flush=True)
                 except Exception:  # noqa: BLE001
                     part_mse = {}
         if fit_done:
             print(f"fit r={args.rank} with the same settings already cached - "
-                  f"skipping (new fit: delete {fit_dir} or change --fit-steps/--fit-method)",
+                  f"skipping (new fit: pass --fit-fresh, or delete {fit_dir}, "
+                  f"or change --fit-steps/--fit-method)",
                   flush=True)
             try:
                 with open(os.path.join(fit_dir, "mse.json"), encoding="utf-8") as f:
@@ -1618,7 +1722,7 @@ def main():
                 if svd_ready:                       # hole-1: real-delta SVD init
                     fit_init.update(torch.load(svd_files[i], map_location="cpu"))
                 fit_mod = FieldSparseMoe(apply_core(ini["geom"],
-                                                    args.bank_init == "t2")
+                                                    args.bank_init in ("t2", "dense"))
                                          | {"field_mode": args.field_mode,
                                             "u_mode": args.u_mode,
                                             "u_rank": args.u_rank},
@@ -1832,7 +1936,7 @@ def main():
                         ini = torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
                                          map_location="cpu")
                         fm = FieldSparseMoe(apply_core(ini["geom"],
-                                                       args.bank_init == "t2")
+                                                       args.bank_init in ("t2", "dense"))
                                             | {"field_mode": args.field_mode,
                                                "u_mode": args.u_mode,
                                                "u_rank": args.u_rank},
@@ -1968,7 +2072,7 @@ def main():
                         prev = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
                                           map_location="cpu")
                         fit_mod = FieldSparseMoe(apply_core(
-                            ini["geom"], args.bank_init == "t2")
+                            ini["geom"], args.bank_init in ("t2", "dense"))
                             | {"field_mode": args.field_mode,
                                "u_mode": args.u_mode,
                                "u_rank": args.u_rank},
@@ -2105,7 +2209,8 @@ def main():
             sys.exit("--save-backbone bf16 for a bnb source is not supported in the "
                      "streaming mode: take a GGUF source (it is light anyway)")
         profile = dict(model=args.model, quant=str(args.gguf_quant), rank=args.rank,
-                       banks=args.banks, field_mode=args.field_mode,
+                       banks=args.banks, bank_init=args.bank_init,
+                       field_mode=args.field_mode,
                        u_mode=args.u_mode, u_rank=args.u_rank,
                        fit_method=args.fit_method, fit_steps=args.fit_steps,
                        fit_bs=args.fit_bs, fit_lr=args.fit_lr,
@@ -2121,12 +2226,12 @@ def main():
                              gguf=light_gguf, profile=profile,
                              io_workers=args.io_threads, io_cache=args.io_cache,
                              field_mode=args.field_mode, banks=args.banks,
-                             core=("dense" if args.bank_init == "t2"
+                             core=("dense" if args.bank_init in ("t2", "dense")
                                    else "diag"),
                              u_mode=args.u_mode, u_rank=args.u_rank)
         full_b, field_b = field_accounting(
             geoms, args.rank, banks=args.banks,
-            core=("dense" if args.bank_init == "t2" else "diag"),
+            core=("dense" if args.bank_init in ("t2", "dense") else "diag"),
             u_mode=args.u_mode, u_rank=args.u_rank)
         T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
                  ratio=full_b / max(field_b, 1), fit_mses=fit_mses,

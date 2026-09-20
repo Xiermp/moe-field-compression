@@ -1,3 +1,24 @@
+# version: 2026-09-13.3 - DENSE-DEFAULT (13.7.1): --bank-init default flips
+#   svd -> dense. Evidence: the dense full core beat the legacy diag init on
+#   EVERY zero-shot A/B to date - the toy TinyMoE, the micro-real MoE
+#   google/switch-base-8 (routed-activation error -6..-11% up / -38..-54%
+#   down, final KL 0.010 vs 0.020 at r=32 after the same fit budget), and
+#   the third geometry HuggingFaceTB/nanowhale-100m-base (E=4, d=320,
+#   dff=640, top-2: lower weight rel-MSE on all 8 layers x all ranks 8/16/32
+#   in the Task-47 zero-shot bench). The user-facing goal is maximal
+#   zero-shot quality with zero tuning - the best-known init is now the
+#   default. --bank-init svd keeps the bit-identical 13.6.x behavior; t2
+#   untouched. No file-format change: dense artifacts already carried
+#   core="dense" since 13.7.
+# version: 2026-09-13.1 - added --bank-init dense (13.7): the FULL core
+#   C_e = U^T dW_e V on the same joint-v2 basis as svd - the zero-shot-first
+#   init mode (best step-0 quality on the toy AND the micro-real MoE, and it
+#   wins after the fit too). Lives in fit_r<rank>dense; the default svd and
+#   the t2 whbank are untouched.
+# version: 2026-09-11.1 - added --fit-fresh (13.6.4): the one-flag "refit
+#   from scratch" - stage 5 ignores fit_meta.json / fit_partial.json /
+#   fit_blk*.pt and refits ALL blocks with the current settings; the pool
+#   and the SVD-init caches are kept. No more manual fit_r* deletion.
 # version: 2026-09-10.2 - CLI-CLARITY (13.6): the "collector" - single source
 #   of truth for the command line. What used to be a 76-flag flat argparse
 #   block plus a 141-line changelog header is now data-driven: (1) COMPONENTS
@@ -345,14 +366,23 @@ GROUPS = [
             "fit_r<rank>b2, old caches untouched (default 1)",
        type=int, choices=(1, 2), default=1),
     _F("--bank-init", "core",
-       short="init: t2 = whitened Tucker-2 dense core (whbank); svd = legacy "
-             "joint diag (UPDATE-13)",
-       full="delta-bank init (UPDATE-13): t2 = Tucker-2 DENSE core from the "
-            "whitened whbank (banks cached in fit_r<rank>t2/whbank) - step-0 "
-            "capture jumps from ~0.3 to the shared-subspace energy; svd "
-            "(default) = legacy joint-aligned diag, bit-identical to "
-            "UPDATE-12",
-       choices=["svd", "t2"], default="svd"),
+       short="init: dense (default) = full core on the joint SVD basis, "
+             "best zero-shot (13.7); t2 = whitened Tucker-2 (whbank); "
+             "svd = legacy joint diag",
+       full="delta-bank init (13.7): dense (DEFAULT) = DENSE core "
+            "C_e = U^T dW_e V on the SAME joint-v2 basis as svd, data-free "
+            "(no calibration pool needed) - the zero-shot step-0 quality "
+            "jumps (micro-real A/B: routed-activation error -6..-11% up "
+            "side, -38..-54% down side; the gain survives the fit; "
+            "confirmed on a third geometry, nanowhale-100m: lower weight "
+            "rel-MSE on every layer and rank). Costs +r^2 per expert "
+            "(~131K floats/block at r=32 - the x60 compression survives); "
+            "fits into fit_r<rank>dense, old caches untouched. t2 = "
+            "Tucker-2 DENSE core from the whitened whbank (banks cached in "
+            "fit_r<rank>t2/whbank) - a converged polish start, not a "
+            "zero-shot pick. svd = legacy joint-aligned diag, bit-identical "
+            "to UPDATE-12 (the 13.6.x default; kept as the compat mode)",
+       choices=["svd", "t2", "dense"], default="dense"),
     _F("--field-mode", "core",
        short="preact = fused mix before the nonlinearity; postact = "
              "per-expert branches (review Variant A)",
@@ -448,6 +478,17 @@ GROUPS = [
        action="store_true"),
     _F("--skip-fit-guard", "opt", short="disable the fit guards entirely",
        action="store_true"),
+    _F("--fit-fresh", "opt",
+       short="refit EVERY block from scratch: ignore fit_meta.json / "
+             "fit_partial.json / fit_blk*.pt (pool + SVD-init kept)",
+       full="--fit-fresh: stage 5 (fit) behaves as if NO fit cache existed "
+            "on disk - every block is refitted from scratch with the "
+            "current settings. The calibration pool and the init_svd_blk* "
+            "caches are NOT touched, so this is cheap to add. The default "
+            "(off) resumes an interrupted fit per block, which is what you "
+            "want after a kill - pass this flag only when you deliberately "
+            "want a clean refit under the same settings.",
+       action="store_true"),
     _F("--refresh-init", "opt",
        short="rebuild ONLY init_svd_blk*.pt for the existing pool and exit",
        action="store_true"),
@@ -536,7 +577,12 @@ GROUPS = [
             "the artifact for the WHOLE run (0 = the value from the GGUF "
             "metadata / artifact). The base log-prob cache goes to a "
             "SEPARATE lp_base_topkN folder, so the native cache and the "
-            "standard verify numbers stay intact",
+            "standard verify numbers stay intact. NOTE (13.6.2): the pair "
+            "pool is ALWAYS collected at the NATIVE k - the field is fitted "
+            "on native-k pairs, so a forced-k run verifies the artifact on "
+            "a routing regime it was not fitted for (the iron test); for "
+            "the sweep on a finished artifact prefer "
+            "--test-only --verify-topk",
        type=int, default=0, metavar="N"),
  ]),
  ("optional - io, memory & speed", [
